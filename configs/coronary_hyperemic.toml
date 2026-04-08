@@ -1,0 +1,15 @@
+root_pressure_mmhg = 100.0
+terminal_pressure_mmhg = 15.0
+discharge_hematocrit = 0.45
+dt = 0.1
+t_end = 20.0
+max_arrival_s = 15.0
+contrast_amplitude = 5.0
+contrast_t0 = 0.5
+contrast_tmax = 4.0
+contrast_alpha = 3.0
+
+[target_flows_ml_min]
+LAD = 242.0
+LCX = 116.0
+RCA = 214.0

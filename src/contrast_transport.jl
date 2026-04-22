@@ -2,11 +2,27 @@
 # Plug-flow model: contrast arrives at each segment after cumulative transit time
 # with dispersion broadening as it propagates deeper
 
+"""
+    ContrastResult
+
+Holds time-resolved contrast concentration.
+
+* When `segment_ids` is empty (legacy behavior), `concentration[s, ti]` is the
+  concentration in segment `s` (`1:nseg` of the source tree) at time `ti`.
+* When `segment_ids` is non-empty (sparse mode, used for very large trees),
+  `concentration[i, ti]` is the concentration in segment `segment_ids[i]`.
+  Segments not listed are implicitly zero.
+
+The sparse variant lets us run contrast simulation on 25M+ segment 8 μm trees
+without allocating a 40 GB matrix per tree.
+"""
 struct ContrastResult
     times::Vector{Float64}                # seconds
-    concentration::Matrix{Float64}        # [n_segments x n_timesteps] mg/mL
-    outlet_concentration::Matrix{Float64} # [n_segments x n_timesteps] mg/mL
+    concentration::Matrix{Float64}        # [n_rows x n_timesteps] mg/mL
+    outlet_concentration::Matrix{Float64} # [n_rows x n_timesteps] mg/mL
+    segment_ids::Vector{Int}              # empty ⇒ dense (row i == segment i)
 end
+ContrastResult(times, C, Cout) = ContrastResult(times, C, Cout, Int[])
 
 # ── Gamma-variate input curve (classic bolus) ──
 function gamma_variate_input(times::Vector{Float64};
@@ -74,10 +90,22 @@ function simulate_contrast(tree::FlowTree, hemo::HemodynamicsResult;
                            t0::Float64=0.5,
                            tmax::Float64=4.0,
                            alpha::Float64=3.0,
-                           max_arrival_s::Float64=0.0)
+                           max_arrival_s::Float64=0.0,
+                           min_diameter_um::Float64=0.0)
     nseg = length(tree.segment_start)
     times = collect(0.0:dt:t_end)
     nt = length(times)
+
+    # Sparse mode: only simulate segments with diameter ≥ min_diameter_um.
+    # Essential for 8 μm capillary trees (25M segs × 200 frames × 8 B = 40 GB
+    # dense, but only the visible ≥50 μm skeleton needs time-resolved data).
+    segment_ids = Int[]
+    if min_diameter_um > 0.0
+        thresh_cm = min_diameter_um * 1e-4
+        segment_ids = findall(d -> d >= thresh_cm, tree.segment_diameter_cm)
+        isempty(segment_ids) && error("No segments with diameter ≥ $(min_diameter_um) μm in $(tree.name)")
+    end
+    nrows = isempty(segment_ids) ? nseg : length(segment_ids)
 
     # Compute raw arrival times
     arrival_raw = _compute_arrival_times(tree, hemo)
@@ -85,7 +113,7 @@ function simulate_contrast(tree::FlowTree, hemo::HemodynamicsResult;
     # Compress arrival times: map [0, p99_arrival] -> [0, effective_window]
     finite_arr = sort(arrival_raw[isfinite.(arrival_raw)])
     if isempty(finite_arr)
-        return ContrastResult(times, zeros(nseg, nt), zeros(nseg, nt))
+        return ContrastResult(times, zeros(nrows, nt), zeros(nrows, nt), segment_ids)
     end
 
     # Auto-determine max arrival if not specified
@@ -119,11 +147,13 @@ function simulate_contrast(tree::FlowTree, hemo::HemodynamicsResult;
     # Dispersion broadening
     t_disp = 3.0  # seconds
 
-    # Concentration arrays
-    C = zeros(nseg, nt)
-    C_out = zeros(nseg, nt)
+    # Concentration arrays (sized by nrows: either full nseg, or filtered subset)
+    C = zeros(nrows, nt)
+    C_out = zeros(nrows, nt)
 
-    for s in 1:nseg
+    # Iterate over rows of the output matrix, mapping row → tree segment index.
+    @inbounds for i in 1:nrows
+        s = isempty(segment_ids) ? i : segment_ids[i]
         !isfinite(arrival[s]) && continue
 
         for ti in 1:nt
@@ -140,12 +170,12 @@ function simulate_contrast(tree::FlowTree, hemo::HemodynamicsResult;
                 tp = (t_input - t0) / (tmax - t0)
                 if tp > 0
                     c_val = amplitude * tp^alpha * exp(alpha * (1.0 - tp)) / disp_factor
-                    C[s, ti] = max(c_val, 0.0)
-                    C_out[s, ti] = C[s, ti]
+                    C[i, ti] = max(c_val, 0.0)
+                    C_out[i, ti] = C[i, ti]
                 end
             end
         end
     end
 
-    return ContrastResult(times, C, C_out)
+    return ContrastResult(times, C, C_out, segment_ids)
 end

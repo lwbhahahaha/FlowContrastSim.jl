@@ -56,22 +56,37 @@ function build_contrast_viewer(path::AbstractString,
         hemo = hemo_results[name]
         nseg = length(tree.segment_start)
 
+        # Map tree segment index → row in cr.concentration. Sparse mode
+        # (non-empty segment_ids) means concentration[row_of_seg[s], ti] — and
+        # segments absent from segment_ids have no time-resolved data (treated
+        # as zero when building conc_frames).
+        sparse_mode = !isempty(cr.segment_ids)
+        row_of_seg = if sparse_mode
+            m = zeros(Int, nseg)
+            @inbounds for (i, s) in pairs(cr.segment_ids)
+                s in eachindex(m) && (m[s] = i)
+            end
+            m
+        else
+            Int[]
+        end
+
         # Select which segments to include:
         # 1. All non-grown segments
-        # 2. All grown segments with flow > threshold
-        # 3. Subsample remaining grown segments for skeleton
+        # 2. All grown segments with flow > threshold (and in sparse mode, in the
+        #    simulated subset so we actually have concentration data for them)
         included = Set{Int}()
         for s in 1:nseg
             if tree.segment_label[s] != "grown"
                 push!(included, s)
-            elseif abs(hemo.segment_flow[s]) > 1e-20
+            elseif abs(hemo.segment_flow[s]) > 1e-20 &&
+                   (!sparse_mode || row_of_seg[s] != 0)
                 push!(included, s)
             end
         end
 
         # If too many, subsample the grown flowing segments by diameter
         if length(included) > max_segments_per_branch
-            # Keep non-grown + top segments by diameter
             primary_segs = [s for s in included if tree.segment_label[s] != "grown"]
             grown_segs = [s for s in included if tree.segment_label[s] == "grown"]
             sort!(grown_segs, by=s -> -tree.segment_diameter_cm[s])
@@ -82,7 +97,7 @@ function build_contrast_viewer(path::AbstractString,
             end
         end
 
-        # Also add some skeleton-only segments (every Nth without flow) for visual completeness
+        # Add skeleton-only segments (every Nth without flow) for visual completeness
         no_flow_segs = [s for s in 1:nseg if !(s in included) && tree.segment_label[s] == "grown"]
         skeleton_stride = isempty(no_flow_segs) ? 1 : max(1, Int(ceil(length(no_flow_segs) / min(2000, length(no_flow_segs)))))
         for i in 1:skeleton_stride:length(no_flow_segs)
@@ -104,10 +119,13 @@ function build_contrast_viewer(path::AbstractString,
             push!(diams, round(1e4 * tree.segment_diameter_cm[s], digits=1))
             push!(lens, round(10.0 * norm(b-a), digits=3))
             push!(seg_ids, s)
+            # Row in cr.concentration for this segment; 0 ⇒ simulation skipped it
+            crow = sparse_mode ? row_of_seg[s] : s
             for (fi, ti_src) in enumerate(1:time_stride:length(first_cr.times))
                 ti_src <= size(cr.concentration, 2) || continue
                 fi <= nt || continue
-                push!(conc_frames[fi], round(cr.concentration[s, ti_src], digits=2))
+                val = (crow == 0) ? 0.0 : cr.concentration[crow, ti_src]
+                push!(conc_frames[fi], round(val, digits=2))
             end
         end
 
@@ -155,7 +173,14 @@ button:hover{background:#444}
 <button id="pause-btn">Pause</button>
 <input id="time-slider" type="range" min="0" max="$(nt-1)" value="0" step="1" style="width:400px">
 <span id="time-readout">t = 0.00 s</span>
-<span style="color:#666;font-size:12px">Total flow: $(join(["$(name)=$(round(sum(hemo_results[name].segment_flow[hemo_results[name].segment_flow .> 0])*60e6, digits=0))" for name in branch_names], ", ")) mL/min</span>
+<span style="color:#666;font-size:12px">Root flow: $(join([begin
+    tr = trees[name]; hm = hemo_results[name]; rf = 0.0
+    for c in tr.children[tr.root_vertex]
+        seg = tr.incoming_segment[c]
+        seg != 0 && (rf += hm.segment_flow[seg])
+    end
+    "$(name)=$(round(rf*60e6, digits=1))"
+end for name in branch_names], ", ")) mL/min</span>
 </div>
 <div id="plot" style="width:100vw;height:85vh"></div>
 <script>""")

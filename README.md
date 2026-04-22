@@ -6,10 +6,18 @@ in vascular trees.
 Given a set of vascular segment CSVs produced by the companion
 **VascularTreeSim.jl** package (or any CSV with the same schema), this package
 computes Poiseuille-based blood flow with diameter-dependent non-Newtonian
-viscosity (Pries 1992 / Pries & Secomb 2005), calibrates terminal capillary-bed
-resistance to match a target flow rate, and simulates a bolus of iodinated
+viscosity (Pries 1992 / Pries & Secomb 2005) and simulates a bolus of iodinated
 contrast agent propagating through the network. Results are exported to a
 self-contained interactive 3-D HTML viewer.
+
+The top-level `run_flow_simulation` is a **natural forward physics simulation**
+— no reverse calibration against target flow. Per-tree `target_flow_ml_min`
+values, if present in the config, are printed for reference in the summary but
+do not modify terminal resistance. The resulting root flow is whatever the tree
+topology, boundary pressures, and Pries viscosity produce — i.e. an honest
+readout of tree conductance at the chosen BCs. Per-segment target calibration
+is still available via the lower-level `compute_hemodynamics` function (pass
+`target_flow_ml_min > 0`) if you need target matching for a specific benchmark.
 
 ---
 
@@ -17,10 +25,17 @@ self-contained interactive 3-D HTML viewer.
 
 - **Poiseuille hemodynamics** -- Hagen-Poiseuille resistance for every segment, with parallel-resistance reduction at bifurcations and top-down pressure/flow computation.
 - **Pries non-Newtonian viscosity** -- Diameter- and hematocrit-dependent apparent viscosity using the Pries 1992 in-vitro model plus the Pries & Secomb 2005 endothelial surface layer (ESL) correction, capturing the Fahraeus-Lindqvist effect in microvessels.
-- **Terminal capillary-bed calibration** -- A lumped resistance is added to every terminal segment and tuned via binary search so that total tree inflow matches a user-specified target flow (e.g. 242 mL/min for the LAD under hyperemic conditions).
+- **Natural-physics forward simulation** -- `run_flow_simulation` returns hemo output under fixed root/terminal pressure BCs with no hidden calibration. Binary-searched terminal-bed calibration remains accessible on the lower-level `compute_hemodynamics` API when an explicit target-flow match is needed.
+- **Streaming CSV loader** -- parses 25-50 M segment CSVs (~8 GB) in under a minute by streaming line-by-line into pre-allocated typed arrays; avoids the `readdlm` `Matrix{Any}` blowup that pushes multi-10-GB trees OOM.
+- **Sparse contrast mode** -- `contrast_min_diameter_um` threshold skips capillary-level segments from the dynamic concentration matrix, so a 30 M-segment tree can be contrast-simulated in ~1 GB instead of the ~50 GB a dense `(nseg × n_timesteps)` matrix would require. Default 0 (dense); the provided `coronary_baseline.toml` uses 50 μm.
 - **Gamma-variate contrast injection** -- Configurable bolus shape (amplitude, onset, peak time, shape exponent).
 - **Plug-flow contrast transport** -- Arrival-time computation with log-compressed time mapping and Taylor-like dispersion broadening for deeper segments.
 - **Interactive 3-D HTML viewer** -- Plotly.js-based visualization with time slider, play/pause animation, per-segment hover info (branch, diameter, length), and a heat-map color scale showing local contrast concentration.
+- **Diagnostic scripts** in `scripts/`:
+  - `natural_flow_summary.jl` -- minimal hemo-only report for a directory of tree CSVs (root flow vs baseline / hyperemic targets, % segments flowing). Skips contrast so 90 M total segments fit in <30 GB.
+  - `tree_diagnostic.jl` -- per-tree geometric breakdown: root-segment R, diameter histogram, per-terminal R-sum.
+  - `dead_segments_diag.jl` -- forensic comparison of parent-ID reachability (CSV) vs BFS reachability (FlowTree); reports vertex-merge histogram.
+  - `xcat_label_dims.jl` -- groups segments by `label` column and reports diameter stats per XCAT anatomical sub-segment.
 
 ---
 

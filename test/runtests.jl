@@ -189,4 +189,31 @@ using LinearAlgebra
 
         rm(html_path)
     end
+
+    @testset "VascularTreeSim CSV Contract" begin
+        # VascularTreeSim writes parent_segment_id=0 (not -1) for root segments.
+        # FlowContrastSim must recognize non-positive values as "no parent".
+        csv_path = tempname() * ".csv"
+        open(csv_path, "w") do io
+            println(io, "branch,segment_id,parent_segment_id,x1_cm,y1_cm,z1_cm,x2_cm,y2_cm,z2_cm,xmid_cm,ymid_cm,zmid_cm,length_mm,diameter_um,label")
+            # Root segment with parent_segment_id=0 (VascularTreeSim convention)
+            println(io, "LAD,1,0,0.0,0.0,0.0,1.0,0.0,0.0,0.5,0.0,0.0,10.0,400.0,xcat")
+            println(io, "LAD,2,1,1.0,0.0,0.0,2.0,0.5,0.0,1.5,0.25,0.0,11.2,300.0,grown")
+            println(io, "LAD,3,1,1.0,0.0,0.0,2.0,-0.5,0.0,1.5,-0.25,0.0,11.2,300.0,grown")
+        end
+        tree = load_tree("LAD", csv_path)
+        @test length(tree.segment_start) == 3
+        @test length(tree.vertices) == 4     # root, bifurcation, 2 terminals
+        # Root vertex must be the one with no incoming segment
+        @test tree.incoming_segment[tree.root_vertex] == 0
+        @test tree.parent_vertex[tree.root_vertex] == 0
+        # Diameters in cm (μm / 1e4)
+        @test tree.segment_diameter_cm[1] ≈ 0.04
+        @test tree.segment_diameter_cm[2] ≈ 0.03
+        # Hemodynamics must run end-to-end on this tree
+        hemo = compute_hemodynamics(tree; target_flow_ml_min=10.0)
+        @test hemo.segment_flow[1] > 0
+        @test hemo.segment_flow[1] ≈ hemo.segment_flow[2] + hemo.segment_flow[3] rtol=1e-6
+        rm(csv_path)
+    end
 end

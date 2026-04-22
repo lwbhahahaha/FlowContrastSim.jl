@@ -1,0 +1,26 @@
+# Julia
+Manifest.toml
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+.julia/
+
+# Simulation outputs — large HTML viewers, CSVs, timestamped snapshots
+output/
+output_*/
+*.html
+*.raw
+
+# Per-run logs emitted by scripts/natural_flow_summary.jl and friends
+*.log
+
+# Test-generated artifacts
+test/output/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

@@ -8,6 +8,10 @@ const DEFAULT_ROOT_PRESSURE_PA     = 13332.0 # 100 mmHg
 const DEFAULT_TERMINAL_PRESSURE_PA = 1999.8  # 15 mmHg
 const DEFAULT_DISCHARGE_HEMATOCRIT = 0.45    # 45% systemic hematocrit
 
+# Conversion constant: 1 mmHg·min/mL → Pa·s/m³.
+# = 133.322 Pa/mmHg × 60 s/min × 1e6 m^-3/mL = 7.99932e9
+const MMHGMIN_PER_ML_TO_PA_S_PER_M3 = 133.322 * 60.0 * 1.0e6
+
 struct HemodynamicsResult
     segment_resistance::Vector{Float64}    # Pa*s/m^3
     segment_flow::Vector{Float64}          # m^3/s
@@ -216,18 +220,46 @@ function _calibrate_terminal_resistance(tree::FlowTree, R::Vector{Float64}, orde
 end
 
 # ── Full hemodynamics computation ──
+#
+# Two ways to add distal (post-leaf) resistance:
+#   * `target_flow_ml_min > 0` — back-solves a uniform terminal_bed_R via binary
+#     search to hit the prescribed root flow. CALIBRATION; violates the project's
+#     "no calibration" rule and is here for legacy/diagnostic use only.
+#   * `capillary_bed_R_per_100g_mmHgmin_ml > 0` + `territory_mass_g > 0` — adds
+#     per-leaf R consistent with Pries-Secomb in-vivo capillary-bed + venous-
+#     return resistance (literature ≈ 0.1-0.5 mmHg·min/mL/100g for hyperemic
+#     coronary myocardium). Each terminal segment gets the same R, computed as
+#     `R_per_terminal = N_terminals × R_territory`, where `R_territory` is the
+#     in-vivo capillary R for the whole territory:
+#         R_territory_clinical [mmHg·min/mL] = R_per_100g × 100 / territory_mass_g
+#     The N_terminals factor converts from territory-aggregate (parallel)
+#     to per-leaf series resistance: N parallel R_per_terminal = R_territory.
+#     This is physical, requires no flow target, preserves the "no calibration"
+#     rule, and (when R_cap dominates path R variation) compresses arrival
+#     times across leaves — uniform myocardium → uniform Q → uniform perfusion.
 function compute_hemodynamics(tree::FlowTree;
                               root_pressure::Float64=DEFAULT_ROOT_PRESSURE_PA,
                               terminal_pressure::Float64=DEFAULT_TERMINAL_PRESSURE_PA,
                               hematocrit::Float64=DEFAULT_DISCHARGE_HEMATOCRIT,
+                              capillary_bed_R_per_100g_mmHgmin_ml::Float64=0.0,
+                              territory_mass_g::Float64=0.0,
                               target_flow_ml_min::Float64=0.0)
     nseg = length(tree.segment_start)
     R = _compute_resistance(tree; hematocrit=hematocrit)
     order = _topo_order(tree)
 
-    # Calibrate terminal bed resistance if target flow specified
+    # Resolve terminal_bed_R. Prefer literature-based capillary R; fall back to
+    # target-flow calibration only if the literature parameter is unset.
     terminal_bed_R = 0.0
-    if target_flow_ml_min > 0
+    if capillary_bed_R_per_100g_mmHgmin_ml > 0 && territory_mass_g > 0
+        terminals = _find_terminals(tree, order)
+        n_term = length(terminals)
+        if n_term > 0
+            R_territory_clin = capillary_bed_R_per_100g_mmHgmin_ml * 100.0 / territory_mass_g
+            R_per_terminal_clin = R_territory_clin * n_term
+            terminal_bed_R = R_per_terminal_clin * MMHGMIN_PER_ML_TO_PA_S_PER_M3
+        end
+    elseif target_flow_ml_min > 0
         target_m3s = target_flow_ml_min / (60.0 * 1e6)
         terminal_bed_R = _calibrate_terminal_resistance(tree, R, order;
             target_flow_m3s=target_m3s,

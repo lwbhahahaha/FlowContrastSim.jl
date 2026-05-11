@@ -1,6 +1,21 @@
+# Coronary flow simulation config — hyperemic (max vasodilated) state.
+#
+# IMPORTANT: this config assumes the tree CSVs in tree_dir are the MAX-DILATED
+# tree (i.e., the original Murray-grown tree without arteriolar tone scaling).
+# Use tree_dir = `VascularTreeSim.jl/output/` when invoking.
+#
+# Physics: max vasodilation removes arteriolar tone (arterioles relax to their
+# anatomical Murray-optimal diameter). The remaining downstream R is the true
+# capillary bed + venous return — Pries-Secomb 2005 in-vivo value ≈ 0.15
+# mmHg·min/mL/100g for hyperemic coronary myocardium. Same cap-R value is
+# used for the at-rest config; state difference comes from tree geometry.
+#
+# Territory masses come from the XCAT vmale50 KDTree partition (perfusion_pipeline
+# step2 output): LAD 58.9 / LCX 60.9 / RCA 63.8 g.
 root_pressure_mmhg = 100.0
 terminal_pressure_mmhg = 15.0
 discharge_hematocrit = 0.45
+capillary_bed_R_per_100g_mmHgmin_ml = 0.15
 dt = 0.1
 t_end = 20.0
 max_arrival_s = 15.0
@@ -8,8 +23,14 @@ contrast_amplitude = 5.0
 contrast_t0 = 0.5
 contrast_tmax = 4.0
 contrast_alpha = 3.0
+contrast_min_diameter_um = 50.0
+
+[territory_masses_g]
+LAD = 58.9
+LCX = 60.9
+RCA = 63.8
 
 [target_flows_ml_min]
-LAD = 242.0
-LCX = 116.0
-RCA = 214.0
+LAD = 200.0
+LCX = 150.0
+RCA = 190.0

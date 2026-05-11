@@ -63,17 +63,19 @@ function run_flow_simulation(tree_csv_dir::String, config::FlowConfig;
         println("[flow] [$(name)] loaded in $(round(time()-t0,digits=1))s: $(length(tree.segment_start)) segs, $(length(tree.vertices)) verts"); flush(stdout)
 
         target = get(config.target_flows_ml_min, name, 0.0)
+        mass_g = get(config.territory_masses_g, name, 0.0)
         t1 = time()
         # NOTE: target_flow_ml_min is intentionally NOT passed here. The target
         # is kept in the config for display/comparison only — root_flow must
-        # emerge naturally from tree topology + Poiseuille + Pries viscosity
-        # under fixed pressure BCs. Passing target here triggers
-        # `_calibrate_terminal_resistance`, which masks whether the tree is
-        # anatomically correct.
+        # emerge from tree topology + Poiseuille + Pries viscosity + physics-
+        # based downstream R (`capillary_bed_R_per_100g_mmHgmin_ml`), not from
+        # back-solving to match a target.
         hemo = compute_hemodynamics(tree;
             root_pressure=root_pressure_pa,
             terminal_pressure=terminal_pressure_pa,
-            hematocrit=config.discharge_hematocrit)
+            hematocrit=config.discharge_hematocrit,
+            capillary_bed_R_per_100g_mmHgmin_ml=config.capillary_bed_R_per_100g_mmHgmin_ml,
+            territory_mass_g=mass_g)
         root_flow = 0.0
         for c in tree.children[tree.root_vertex]
             seg = tree.incoming_segment[c]
@@ -116,6 +118,7 @@ function run_flow_simulation(tree_csv_dir::String, config::FlowConfig;
     println("="^60)
     println("Pressure: $(config.root_pressure_mmhg) mmHg -> $(config.terminal_pressure_mmhg) mmHg")
     println("Hematocrit: $(config.discharge_hematocrit)")
+    println("Capillary bed R: $(config.capillary_bed_R_per_100g_mmHgmin_ml) mmHg·min/mL/100g")
     for name in sort(collect(keys(trees)))
         root_flow = 0.0
         for c in trees[name].children[trees[name].root_vertex]

@@ -1,511 +1,316 @@
 # FlowContrastSim.jl
 
-A Julia package for hemodynamic flow simulation and dynamic contrast transport
-in vascular trees.
+Hemodynamic flow simulation and dynamic contrast transport on vascular trees
+produced by [VascularTreeSim.jl](../VascularTreeSim.jl) (or any CSV that
+follows the same schema).
 
-Given a set of vascular segment CSVs produced by the companion
-**VascularTreeSim.jl** package (or any CSV with the same schema), this package
-computes Poiseuille-based blood flow with diameter-dependent non-Newtonian
-viscosity (Pries 1992 / Pries & Secomb 2005) and simulates a bolus of iodinated
-contrast agent propagating through the network. Results are exported to a
-self-contained interactive 3-D HTML viewer.
+Given a tree CSV plus boundary pressures + a per-100 g downstream resistance,
+the package computes Poiseuille flow with diameter-dependent non-Newtonian
+viscosity (Pries 1992 / Pries & Secomb 2005), distributes flow across the
+tree, and (optionally) simulates a contrast bolus propagating through the
+network with a per-segment time-of-arrival + dispersion model. Results are
+exported to a self-contained 3-D HTML viewer.
 
-The top-level `run_flow_simulation` is a **natural forward physics simulation**
-— no reverse calibration against target flow. Per-tree `target_flow_ml_min`
-values, if present in the config, are printed for reference in the summary but
-do not modify terminal resistance. The resulting root flow is whatever the tree
-topology, boundary pressures, and Pries viscosity produce — i.e. an honest
-readout of tree conductance at the chosen BCs. Per-segment target calibration
-is still available via the lower-level `compute_hemodynamics` function (pass
-`target_flow_ml_min > 0`) if you need target matching for a specific benchmark.
+The simulator is **physics-only — no calibration**. Root flow is whatever the
+tree topology, BCs, viscosity, and the literature-derived capillary-bed
+resistance produce; nothing back-solves to hit a target. The package is also
+**organ-agnostic** — pass a brain-vessel or skeletal-muscle CSV with matching
+configs and the same pipeline runs.
 
 ---
 
-## Features
+## Pipeline
 
-- **Poiseuille hemodynamics** -- Hagen-Poiseuille resistance for every segment, with parallel-resistance reduction at bifurcations and top-down pressure/flow computation.
-- **Pries non-Newtonian viscosity** -- Diameter- and hematocrit-dependent apparent viscosity using the Pries 1992 in-vitro model plus the Pries & Secomb 2005 endothelial surface layer (ESL) correction, capturing the Fahraeus-Lindqvist effect in microvessels.
-- **Natural-physics forward simulation** -- `run_flow_simulation` returns hemo output under fixed root/terminal pressure BCs with no hidden calibration. Binary-searched terminal-bed calibration remains accessible on the lower-level `compute_hemodynamics` API when an explicit target-flow match is needed.
-- **Streaming CSV loader** -- parses 25-50 M segment CSVs (~8 GB) in under a minute by streaming line-by-line into pre-allocated typed arrays; avoids the `readdlm` `Matrix{Any}` blowup that pushes multi-10-GB trees OOM.
-- **Sparse contrast mode** -- `contrast_min_diameter_um` threshold skips capillary-level segments from the dynamic concentration matrix, so a 30 M-segment tree can be contrast-simulated in ~1 GB instead of the ~50 GB a dense `(nseg × n_timesteps)` matrix would require. Default 0 (dense); the provided `coronary_baseline.toml` uses 50 μm.
-- **Gamma-variate contrast injection** -- Configurable bolus shape (amplitude, onset, peak time, shape exponent).
-- **Plug-flow contrast transport** -- Arrival-time computation with log-compressed time mapping and Taylor-like dispersion broadening for deeper segments.
-- **Interactive 3-D HTML viewer** -- Plotly.js-based visualization with time slider, play/pause animation, per-segment hover info (branch, diameter, length), and a heat-map color scale showing local contrast concentration.
-- **Diagnostic scripts** in `scripts/`:
-  - `natural_flow_summary.jl` -- minimal hemo-only report for a directory of tree CSVs (root flow vs baseline / hyperemic targets, % segments flowing). Skips contrast so 90 M total segments fit in <30 GB.
-  - `tree_diagnostic.jl` -- per-tree geometric breakdown: root-segment R, diameter histogram, per-terminal R-sum.
-  - `dead_segments_diag.jl` -- forensic comparison of parent-ID reachability (CSV) vs BFS reachability (FlowTree); reports vertex-merge histogram.
-  - `xcat_label_dims.jl` -- groups segments by `label` column and reports diameter stats per XCAT anatomical sub-segment.
+```
+<tree>_segments.csv  (at-rest geometry)        <tree>_segments.csv  (max-dilated)
+            │                                              │
+            ▼                                              ▼
+┌─────────────────────────┐                  ┌─────────────────────────┐
+│ coronary_baseline.toml  │                  │ coronary_hyperemic.toml │
+│   cap_R = 0.15          │                  │   cap_R = 0.15          │
+│   (state diff comes     │                  │   (same literature      │
+│    from tree geometry)  │                  │    value — no calib)    │
+└─────────────────────────┘                  └─────────────────────────┘
+            │                                              │
+            ▼                                              ▼
+┌─────────────────────────┐                  ┌─────────────────────────┐
+│ run_flow_simulation     │                  │ run_flow_simulation     │
+│   1. load_tree (parent- │                  │      (same code path)   │
+│      id topology)       │                  │                         │
+│   2. Poiseuille + Pries │                  │                         │
+│   3. R_terminal_bed     │                  │                         │
+│      from cap_R × mass  │                  │                         │
+│   4. top-down flow      │                  │                         │
+│   5. contrast transport │                  │                         │
+└─────────────────────────┘                  └─────────────────────────┘
+            │                                              │
+            ▼                                              ▼
+   baseline 47/52/57 mL/min               hyperemic 166/179/196 mL/min
+   (LAD/LCX/RCA, CFR 3.4-3.5×)
+```
+
+---
+
+## Key concepts
+
+**load_tree uses `parent_segment_id`, not coordinate dedup.** Dense subdivided
+trees (~110 M segments / LCX in ~60 g of myocardium) pack endpoints tightly
+enough that 10 nm coordinate rounding can merge unrelated vertices. The older
+dedup-by-coordinates loader overwrote `incoming_segment[v]` and orphaned a few
+thousand grown segments together with ~23 M subdivided descendants from the
+flow BFS — observed as "21% of LCX segs not flowing". The current loader
+walks the `parent_segment_id` chain that the grower writes deterministically:
+each segment gets its own unique end vertex, its start vertex is its parent's
+end vertex. No coordinate coincidence is consulted. The bug is permanently
+gone; running it on a brain tree, a muscle tree, or any other CSV that
+follows the schema works the same way.
+
+**Pries + Fahraeus-Lindqvist viscosity.** Apparent viscosity tracks Pries 1992
+(in-vitro) corrected by Pries & Secomb 2005's endothelial surface layer
+(adds an effective glycocalyx in 10–150 μm vessels):
+- bulk blood viscosity at large D
+- decreases at 10–300 μm (cell-free plasma layer near wall)
+- rises sharply below ~10 μm (RBC squeeze) — divergent at 2.7 μm
+
+**Physics-grounded downstream R, no target back-solve.** Each terminal
+segment gets a series resistance such that the per-territory total is the
+literature value:
+
+```
+R_per_terminal = (capillary_bed_R_per_100g_mmHgmin_ml × 100 / territory_mass_g) × n_terminals
+```
+
+When all `n_terminals` are combined in parallel back at the root, the
+effective downstream R equals the territory's per-100 g cap-bed R. The
+hyperemic value 0.15 mmHg·min/mL/100 g comes directly from Pries & Secomb
+2005 for myocardium. The same parameter applies to baseline — the state
+difference comes from the **tree geometry**, not from changing this knob (see
+"strict dilation" below).
+
+`compute_hemodynamics` also still accepts `target_flow_ml_min` to back-solve a
+uniform terminal-bed R via binary search. **Don't use that on production runs**
+— it violates the no-calibration rule and is kept only for legacy benchmarks.
+
+**Strict dilation, not lumped tone.** Two coronary states use two trees:
+
+- **Max-dilated**: the as-grown tree (Murray-optimal diameters). Used for the
+  hyperemic config.
+- **At-rest**: max-dilated tree with arteriolar diameters scaled down by the
+  bell-curve tone function in
+  [`VascularTreeSim.jl/scripts/scale_to_rest.jl`](../VascularTreeSim.jl/scripts/scale_to_rest.jl).
+  Peak constriction at 100 μm, conduit (> 1 mm) and capillary (< 10 μm)
+  almost unchanged.
+
+Both configs use the same `cap_R = 0.15`. CFR (coronary flow reserve) is then
+a property of the **anatomical scaling**, not a free parameter — matching how
+real myocardium controls perfusion through arteriolar smooth muscle. This
+also gives the right vessel diameters to a virtual CT scanner: an at-rest CT
+sees constricted arterioles, a hyperemic CT sees max-dilated arterioles, both
+from the same underlying anatomy.
+
+**Sparse contrast.** The default `contrast_min_diameter_um = 50` skips
+capillary-level segments from the `(n_segs × n_timesteps)` concentration
+matrix. Without this a 110 M-segment LCX would need ~50 GB just for the
+contrast field. Hemodynamics (R + flow + transit time) is still computed for
+every segment.
 
 ---
 
 ## Installation
 
-Requires Julia >= 1.9. Not yet registered in the Julia General registry.
+Requires Julia ≥ 1.9. Not registered in General; develop from a local clone:
 
 ```julia
 using Pkg
-
-# From a local clone:
 Pkg.develop(path="/path/to/FlowContrastSim.jl")
-
-# Or from a Git URL:
-Pkg.add(url="https://github.com/your-org/FlowContrastSim.jl.git")
+Pkg.instantiate()
 ```
 
-## Testing
-
-```julia
-using Pkg
-Pkg.test("FlowContrastSim")
-```
-
-Runs unit tests for the Pries viscosity model, gamma-variate input, synthetic
-tree hemodynamics (Y-bifurcation flow conservation), contrast transport, config
-loading, and viewer generation.
-
-### Dependencies
-
-All dependencies are standard Julia packages declared in `Project.toml`:
-
-| Package | Purpose |
-|---|---|
-| `DelimitedFiles` | CSV reading |
-| `LinearAlgebra` | Vector norms for segment lengths |
-| `StaticArrays` | `SVector{3,Float64}` for 3-D vertex coordinates |
-| `Statistics` | Summary statistics |
-| `TOML` | Configuration file parsing |
-
-No external binaries or compiled libraries are required.
+Dependencies are `StaticArrays`, `TOML`, `NearestNeighbors`, plus Julia
+stdlibs. No GPU dependency.
 
 ---
 
-## Quick Start
+## Quick start — coronary
+
+Assume you have grown trees in `../VascularTreeSim.jl/output/` (max-dilated)
+and `../VascularTreeSim.jl/output_at_rest/` (post-`scale_to_rest.jl`). The
+canonical natural-physics report is:
+
+```bash
+# baseline (at-rest tree)
+julia --project=. scripts/natural_flow_summary.jl \
+      ../VascularTreeSim.jl/output_at_rest \
+      configs/coronary_baseline.toml
+
+# hyperemic (max-dilated tree)
+julia --project=. scripts/natural_flow_summary.jl \
+      ../VascularTreeSim.jl/output \
+      configs/coronary_hyperemic.toml
+```
+
+Each invocation loads three trees (~3 min each) and prints per-tree root
+flow + % segments flowing. Full report ~15 min per state.
+
+For the dynamic contrast pipeline (writes a Plotly HTML viewer):
 
 ```julia
 using FlowContrastSim
-
-# 1. Load configuration
-config = load_flow_config("configs/coronary_hyperemic.toml")
-
-# 2. Run the full pipeline (discover CSVs, compute flow, simulate contrast, build viewer)
-results = run_flow_simulation("path/to/tree_csvs/", config; output_dir="output")
-
-# results.trees             -- Dict{String, FlowTree}
-# results.hemo_results      -- Dict{String, HemodynamicsResult}
-# results.contrast_results  -- Dict{String, ContrastResult}
-# results.viewer_path       -- path to the generated HTML file
+cfg = load_flow_config("configs/coronary_hyperemic.toml")
+result = run_flow_simulation("../VascularTreeSim.jl/output", cfg;
+                             output_dir="out_hyperemic")
+# result.trees, result.hemo_results, result.contrast_results, result.viewer_path
 ```
 
-Or drive each step manually:
-
-```julia
-using FlowContrastSim
-
-# Load a single tree
-tree = load_tree("LAD", "lad_grown_segments.csv")
-
-# Compute hemodynamics with a target flow of 242 mL/min
-hemo = compute_hemodynamics(tree;
-    root_pressure   = 100.0 * 133.322,   # 100 mmHg in Pa
-    terminal_pressure = 15.0 * 133.322,   # 15 mmHg in Pa
-    hematocrit      = 0.45,
-    target_flow_ml_min = 242.0)
-
-# Simulate contrast bolus
-cr = simulate_contrast(tree, hemo;
-    dt=0.1, t_end=20.0,
-    amplitude=5.0, t0=0.5, tmax=4.0, alpha=3.0)
-
-# Access per-segment data
-hemo.segment_flow          # m^3/s per segment
-hemo.pressure_proximal     # Pa
-hemo.transit_time_s        # seconds
-cr.concentration           # [n_segments x n_timesteps] matrix, mg/mL
-```
+`scripts/lad_stenosis_sweep.jl` shrinks every `dias_lad1` (proximal LAD)
+segment by 0–90% in 10 % increments and writes a CSV / PNG of the Gould-style
+flow vs stenosis curve.
 
 ---
 
-## Input Format
-
-Tree CSVs are produced by the **VascularTreeSim.jl** package. Each row describes one vessel segment. Required columns:
-
-| Column | Units | Description |
-|---|---|---|
-| `segment_id` | integer | Unique segment identifier |
-| `parent_segment_id` | integer | ID of the parent segment (`-1` or empty for root segments) |
-| `x1_cm`, `y1_cm`, `z1_cm` | cm | Proximal (start) endpoint coordinates |
-| `x2_cm`, `y2_cm`, `z2_cm` | cm | Distal (end) endpoint coordinates |
-| `diameter_um` | micrometers | Segment diameter |
-| `label` | string | Segment category (e.g. `"epicardial"`, `"grown"`) |
-
-Additional columns present in the CSV but not consumed by this package: `branch`, `xmid_cm`, `ymid_cm`, `zmid_cm`, `length_mm`.
-
-When `parent_segment_id` is present, topology is reconstructed deterministically via the parent-child links. When it is absent (older CSVs), the loader falls back to nearest-vertex matching for backward compatibility.
-
----
-
-## FlowConfig TOML Schema
-
-All simulation parameters are set in a single TOML file. Below is the complete schema with default values:
+## Config TOML schema
 
 ```toml
-# ── Hemodynamics ──
-root_pressure_mmhg     = 100.0   # Aortic root pressure (mmHg)
-terminal_pressure_mmhg = 15.0    # Distal capillary bed pressure (mmHg)
-discharge_hematocrit   = 0.45    # Systemic discharge hematocrit (fraction, 0-1)
+root_pressure_mmhg    = 100.0
+terminal_pressure_mmhg = 15.0
+discharge_hematocrit  = 0.45
 
-# ── Time grid ──
-dt    = 0.1    # Simulation time step (seconds)
-t_end = 20.0   # Total simulation duration (seconds)
+# physics-grounded downstream R (Pries-Secomb in-vivo for myocardium):
+capillary_bed_R_per_100g_mmHgmin_ml = 0.15
 
-# ── Contrast bolus (gamma-variate) ──
-contrast_amplitude = 5.0    # Peak concentration at injection site (mg/mL)
-contrast_t0        = 0.5    # Bolus onset time (seconds)
-contrast_tmax      = 4.0    # Time of peak input concentration (seconds)
-contrast_alpha     = 3.0    # Shape exponent (higher = sharper bolus)
+# contrast bolus shape (gamma-variate)
+contrast_amplitude = 5.0   # mg I / mL peak
+contrast_t0   = 0.5        # s onset
+contrast_tmax = 4.0        # s peak
+contrast_alpha = 3.0       # shape
+dt    = 0.1                # s — simulation timestep
+t_end = 20.0               # s
+max_arrival_s = 15.0       # truncate plug-flow arrival lookup
+contrast_min_diameter_um = 50.0   # skip contrast on segs below this diameter
 
-# ── Contrast transport ──
-max_arrival_s = 15.0   # Maximum compressed arrival time window (seconds).
-                       # Controls the time-compression mapping that maps
-                       # raw arrival times into the visualization window.
-                       # Set to 0 for automatic (t_end - tmax).
+# per-tree territory mass for cap_R parallel→series conversion
+[territory_masses_g]
+LAD = 58.9
+LCX = 60.9
+RCA = 63.8
 
-# ── Target flow rates (per branch) ──
-# Keys must match branch names derived from CSV filenames.
-# Branch names are uppercased, with suffixes like "_grown_segments"
-# stripped automatically (e.g. "lad_grown_segments.csv" -> "LAD").
-# Set to 0 or omit a branch to skip calibration for that branch.
+# clinical reference values for the SUMMARY printout (display only — they
+# do NOT enter the physics)
 [target_flows_ml_min]
-LAD = 242.0    # mL/min, hyperemic LAD flow
-LCX = 116.0    # mL/min, hyperemic LCx flow
-RCA = 214.0    # mL/min, hyperemic RCA flow
+LAD = 50.0
+LCX = 30.0
+RCA = 50.0
 ```
 
-### Field Reference
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `root_pressure_mmhg` | Float | 100.0 | Inlet pressure at the root of the tree |
-| `terminal_pressure_mmhg` | Float | 15.0 | Outlet pressure at every terminal (capillary bed) |
-| `discharge_hematocrit` | Float | 0.45 | Hematocrit used for Pries viscosity calculation |
-| `dt` | Float | 0.1 | Contrast simulation time step in seconds |
-| `t_end` | Float | 20.0 | End time of contrast simulation in seconds |
-| `contrast_amplitude` | Float | 5.0 | Peak bolus concentration (mg/mL) |
-| `contrast_t0` | Float | 0.5 | Bolus arrival time at tree root (seconds) |
-| `contrast_tmax` | Float | 4.0 | Time of peak input concentration (seconds) |
-| `contrast_alpha` | Float | 3.0 | Gamma-variate shape parameter |
-| `max_arrival_s` | Float | 15.0 | Compressed arrival-time window (seconds); 0 = auto |
-| `target_flows_ml_min` | Table | `{}` | Per-branch target total flow in mL/min |
+Both `configs/coronary_baseline.toml` and `configs/coronary_hyperemic.toml`
+ship with the same `cap_R = 0.15` and `territory_masses_g`; only the comment
+about which tree directory to pair them with differs. To target a brain
+tree, swap the masses, swap the tree dir, leave the physics knobs alone.
 
 ---
 
-## Hemodynamics Model
+## CSV contract
 
-### Overview
+Input columns (produced by `VascularTreeSim.jl`):
 
-The hemodynamic solver treats the vascular tree as an electrical circuit: each vessel segment is a resistor, bifurcations are parallel junctions, and flow is driven by the pressure difference between the aortic root and the terminal capillary bed.
-
-### Poiseuille Resistance
-
-Each segment's resistance is:
-
-```
-R = 8 * mu * L / (pi * r^4)
-```
-
-where `L` is the segment length, `r` is the radius, and `mu` is the **apparent viscosity** (not a fixed constant -- see below).
-
-### Diameter-Dependent Viscosity (Pries Model)
-
-Blood is not a Newtonian fluid. In tubes smaller than about 300 micrometers, the apparent viscosity drops significantly due to the formation of a cell-free plasma layer near the vessel wall (the **Fahraeus-Lindqvist effect**). Below roughly 7 micrometers, viscosity rises sharply again because red blood cells must deform to squeeze through. This package implements the full Pries parameterization rather than using a constant bulk viscosity.
-
-The computation proceeds in three steps:
-
-1. **Reference viscosity at Hd = 0.45** (Pries 1992, Equations 1-3):
-
-   ```
-   eta_0.45(D) = 220 * exp(-1.3*D) + 3.2 - 2.44 * exp(-0.06 * D^0.645)
-   ```
-
-   where `D` is the vessel diameter in micrometers. This captures the U-shaped viscosity curve: high for very small tubes, minimum around 7 micrometers, rising back toward the bulk value for large tubes.
-
-2. **Hematocrit correction** via the `C(D)` parameter:
-
-   ```
-   C(D) = (0.8 + exp(-0.075*D)) * (-1 + 1/(1 + 1e-11 * D^12)) + 1/(1 + 1e-11 * D^12)
-
-   eta_rel(D, Hd) = 1 + (eta_0.45 - 1) * ((1 - Hd)^C - 1) / ((1 - 0.45)^C - 1)
-   ```
-
-3. **Endothelial surface layer (ESL) correction** (Pries & Secomb 2005): For vessels with diameters between 10 and 150 micrometers, a 1.1 micrometer glycocalyx layer lines the endothelium, reducing the effective lumen:
-
-   ```
-   D_eff = D - 2 * 1.1 um
-   eta_in_vivo = eta_in_vitro * (D / D_eff)^4
-   ```
-
-   The fourth-power scaling comes from the Poiseuille relation: halving the effective radius increases resistance 16-fold.
-
-The apparent viscosity in Pa*s is then:
-
-```
-mu = eta_plasma * eta_rel
-```
-
-where `eta_plasma = 0.0012 Pa*s` (1.2 cP).
-
-For vessels below 2.7 micrometers, the model returns an effectively infinite viscosity (flow is blocked).
-
-### Subtree Resistance and Flow Distribution
-
-Resistances are combined bottom-up:
-
-- **Terminal segments**: `R_subtree = R_segment + R_bed` (where `R_bed` is the calibrated capillary-bed resistance).
-- **Bifurcations**: Children combine in parallel: `1/R_children = sum(1/R_child_i)`, then `R_subtree = R_segment + R_children`.
-
-Flow is distributed top-down: the root segment receives `Q = dP / R_subtree_root`, and at each bifurcation flow splits inversely proportional to child subtree resistances.
-
-### Terminal Bed Calibration
-
-When a `target_flow_ml_min` is specified for a branch, the solver finds a uniform terminal-bed resistance `R_bed` (appended to every leaf segment) such that total tree inflow equals the target. This is solved by binary search over 60 iterations, which converges to machine precision. If the tree's intrinsic resistance already limits flow below the target, `R_bed` is set to zero.
-
----
-
-## Contrast Transport Model
-
-### Plug-Flow Assumption
-
-Contrast agent is modeled as a passive tracer that propagates with the local blood velocity. Each segment's **transit time** is:
-
-```
-tau = V / Q = (pi * r^2 * L) / Q
-```
-
-The **arrival time** at a segment's midpoint is the cumulative sum of half-transit-times along the path from root:
-
-```
-arrival[root] = tau_root / 2
-arrival[child] = arrival[parent] + tau_parent/2 + tau_child/2
-```
-
-### Time Compression
-
-Raw arrival times in a large tree can span many orders of magnitude (microseconds in epicardial vessels to minutes in terminal arterioles). For visualization, arrival times are log-compressed into a configurable window:
-
-```
-arrival_compressed = max_arrival_s * log(1 + arrival_raw / scale) / log(1 + p99 / scale)
-```
-
-where `scale` is the 25th-percentile raw arrival time and `p99` is the 99th percentile.
-
-### Input Bolus
-
-The contrast input at the tree root follows a **gamma-variate** curve:
-
-```
-C_input(t) = A * ((t - t0) / (tmax - t0))^alpha * exp(alpha * (1 - (t - t0) / (tmax - t0)))
-```
-
-for `t > t0`, and zero otherwise. Parameters:
-- `A` (amplitude): peak concentration in mg/mL
-- `t0`: bolus onset time
-- `tmax`: time of peak concentration
-- `alpha`: shape exponent (higher values produce a sharper, more peaked bolus)
-
-### Dispersion
-
-As contrast propagates deeper into the tree, the bolus broadens due to Taylor dispersion and mixing at bifurcations. This is modeled by a dispersion factor:
-
-```
-disp_factor = sqrt(1 + arrival / t_disp)
-```
-
-where `t_disp = 3.0 s` is the dispersion time constant. The factor stretches the time axis of the input curve and reduces its amplitude by `1/disp_factor`, conserving the total amount of contrast.
-
----
-
-## Viewer
-
-`build_contrast_viewer` generates a self-contained HTML file that uses Plotly.js (loaded from CDN) for 3-D rendering. No server is needed; open the file in any modern browser.
-
-### Features
-
-- **Time slider** -- Drag to any time point in the simulation. The readout shows the current time in seconds.
-- **Play / Pause** -- Animate through all time frames at approximately 12 fps (80 ms per frame).
-- **3-D rotation, zoom, pan** -- Standard Plotly.js orbit controls (click-drag to rotate, scroll to zoom, right-drag to pan).
-- **Segment hover info** -- Hovering over a marker shows: branch name, segment ID, diameter in micrometers, and length in millimeters.
-- **Concentration color scale** -- Segments are colored from dark (no contrast) through blue and orange to red (peak concentration). A color bar shows the mapping in mg/mL.
-- **Skeleton overlay** -- A faint wireframe of the full tree structure is drawn beneath the concentration markers so that unfilled segments remain visible.
-- **Multi-branch support** -- Each branch (LAD, LCx, RCA, etc.) is rendered as a separate Plotly trace with an auto-assigned color from a 10-color palette. Branches can be toggled on and off via the legend.
-- **Segment budget** -- To keep the viewer responsive, each branch is limited to `max_segments_per_branch` marker points (default 6000). Non-grown (epicardial) segments are always included; grown segments are prioritized by diameter. A subsampled skeleton is added for visual completeness.
-
----
-
-## API Reference
-
-### Types
-
-**`FlowTree`** -- Read-only representation of a vascular tree loaded from CSV.
-
-| Field | Type | Description |
+| column | unit | role |
 |---|---|---|
-| `name` | `String` | Branch name |
-| `vertices` | `Vector{SVector{3,Float64}}` | 3-D vertex coordinates in cm |
-| `parent_vertex` | `Vector{Int}` | Parent vertex index for each vertex |
-| `children` | `Vector{Vector{Int}}` | Child vertex indices for each vertex |
-| `incoming_segment` | `Vector{Int}` | Segment index whose distal end is this vertex |
-| `segment_start` | `Vector{Int}` | Proximal vertex index per segment |
-| `segment_end` | `Vector{Int}` | Distal vertex index per segment |
-| `segment_diameter_cm` | `Vector{Float64}` | Diameter in cm |
-| `segment_label` | `Vector{String}` | Label string (e.g. `"epicardial"`, `"grown"`) |
-| `root_vertex` | `Int` | Index of the root vertex |
+| `segment_id` | int | unique within tree |
+| `parent_segment_id` | int | **authoritative topology** (0 = root, > 0 = id of segment whose end vertex is this segment's start vertex) |
+| `x1,y1,z1, x2,y2,z2` | cm | endpoint coords (used only for length computation) |
+| `length_mm`, `diameter_um` | — | scalar per-segment fields |
+| `label` | — | `dias_*` for XCAT, `grown` / `subdivided` for generated branches |
 
-**`FlowConfig`** -- All simulation parameters (see TOML schema above).
-
-**`HemodynamicsResult`** -- Output of `compute_hemodynamics`.
-
-| Field | Type | Units | Description |
-|---|---|---|---|
-| `segment_resistance` | `Vector{Float64}` | Pa*s/m^3 | Poiseuille resistance per segment |
-| `segment_flow` | `Vector{Float64}` | m^3/s | Volume flow rate per segment |
-| `pressure_proximal` | `Vector{Float64}` | Pa | Pressure at proximal end |
-| `pressure_distal` | `Vector{Float64}` | Pa | Pressure at distal end |
-| `segment_volume_m3` | `Vector{Float64}` | m^3 | Cylindrical volume of each segment |
-| `transit_time_s` | `Vector{Float64}` | s | Volume / flow rate |
-
-**`ContrastResult`** -- Output of `simulate_contrast`.
-
-| Field | Type | Description |
-|---|---|---|
-| `times` | `Vector{Float64}` | Time grid in seconds |
-| `concentration` | `Matrix{Float64}` | `[n_segments x n_timesteps]` concentration in mg/mL |
-| `outlet_concentration` | `Matrix{Float64}` | `[n_segments x n_timesteps]` outlet concentration in mg/mL |
-
-### Functions
-
-```julia
-load_flow_config(path::String) -> FlowConfig
-```
-Parse a TOML configuration file into a `FlowConfig`.
-
-```julia
-load_tree(name::String, csv_path::String) -> FlowTree
-```
-Load a single vascular tree from a CSV file. `name` is an arbitrary label (e.g. `"LAD"`).
-
-```julia
-load_trees(dict::Dict{String,String}) -> Dict{String, FlowTree}
-```
-Load multiple trees from a dictionary of `name => csv_path`.
-
-```julia
-compute_hemodynamics(tree::FlowTree;
-    root_pressure::Float64       = 13332.0,   # 100 mmHg in Pa
-    terminal_pressure::Float64   = 1999.8,     # 15 mmHg in Pa
-    hematocrit::Float64          = 0.45,
-    target_flow_ml_min::Float64  = 0.0         # 0 = no calibration
-) -> HemodynamicsResult
-```
-Compute steady-state Poiseuille flow with Pries viscosity. If `target_flow_ml_min > 0`, a terminal-bed resistance is calibrated so that total root inflow matches the target.
-
-```julia
-simulate_contrast(tree::FlowTree, hemo::HemodynamicsResult;
-    dt::Float64            = 0.05,
-    t_end::Float64         = 30.0,
-    root_input             = nothing,    # custom input curve, or nothing for gamma-variate
-    amplitude::Float64     = 5.0,
-    t0::Float64            = 0.5,
-    tmax::Float64          = 4.0,
-    alpha::Float64         = 3.0,
-    max_arrival_s::Float64 = 0.0         # 0 = auto
-) -> ContrastResult
-```
-Simulate contrast propagation using plug-flow transport with dispersion. Pass a custom `root_input` vector (same length as `times`) to override the default gamma-variate bolus.
-
-```julia
-gamma_variate_input(times::Vector{Float64};
-    amplitude=5.0, t0=0.5, tmax=4.0, alpha=3.0
-) -> Vector{Float64}
-```
-Generate a gamma-variate concentration-time curve. Useful for constructing a custom input or for plotting the injection profile.
-
-```julia
-build_contrast_viewer(path, trees, hemo_results, contrast_results;
-    time_stride=1, title="Dynamic Contrast Transport",
-    max_segments_per_branch=8000, branch_colors=nothing
-) -> String
-```
-Write a self-contained HTML file with an interactive 3-D contrast viewer. Returns the output path. `time_stride` controls temporal subsampling (e.g. `3` keeps every third frame to reduce file size). `branch_colors` is an optional `Dict{String,String}` mapping branch names to CSS color strings.
-
-```julia
-run_flow_simulation(tree_csv_dir::String, config::FlowConfig;
-    output_dir="output"
-) -> NamedTuple
-```
-End-to-end pipeline: discover CSVs in `tree_csv_dir`, compute hemodynamics, simulate contrast, build viewer, and return all results. CSV files are matched by `*.csv`; branch names are derived from filenames by stripping suffixes like `_grown_segments` and uppercasing.
-
-```julia
-pries_viscosity_relative(diameter_um::Float64; hematocrit=0.45) -> Float64
-```
-Compute the relative apparent viscosity (eta_apparent / eta_plasma) for a given vessel diameter and hematocrit using the Pries 1992 model with the Pries & Secomb 2005 ESL correction.
-
-```julia
-apparent_viscosity(diameter_um::Float64; hematocrit=0.45) -> Float64
-```
-Compute the absolute apparent viscosity in Pa*s (= eta_plasma * eta_relative).
+The loader rebuilds topology from `parent_segment_id` only. Older trees
+without that column fall through to a legacy coordinate-dedup path; emit a
+warning if you see "detached roots".
 
 ---
 
-## Physics: Why Constant Viscosity Is Wrong for Microvessels
+## Output
 
-### The Fahraeus-Lindqvist Effect
+`run_flow_simulation` returns `(trees, hemo_results, contrast_results,
+viewer_path)`. `hemo_results[name]` is a `HemodynamicsResult` with
+per-segment vectors:
 
-When blood flows through tubes smaller than about 300 micrometers in diameter, its apparent viscosity is significantly lower than the bulk value measured in a standard viscometer (approximately 3.5 cP at 45% hematocrit). This phenomenon, first reported by Fahraeus and Lindqvist in 1931, arises because red blood cells migrate toward the tube axis, leaving a cell-free (or cell-depleted) plasma layer along the wall. Since the wall shear rate is highest near the boundary, and the near-wall fluid is predominantly low-viscosity plasma, the effective (apparent) viscosity of the tube as a whole drops.
+| field | unit | what |
+|---|---|---|
+| `segment_resistance` | Pa·s/m³ | Poiseuille × Pries viscosity |
+| `segment_flow` | m³/s | top-down distributed flow |
+| `pressure_proximal`, `pressure_distal` | Pa | per-segment pressures |
+| `segment_volume_m3` | m³ | π r² L |
+| `transit_time_s` | s | volume / |flow| |
 
-The effect is diameter-dependent:
+`contrast_results[name]` is a `ContrastResult` with a sparse `(n_sim_segs ×
+n_timesteps)` concentration matrix and a `simulated_segment_ids` index.
+The Plotly HTML viewer (`viewer_path`) animates this with a time slider +
+play/pause + per-segment hover.
 
-- **D > 300 um**: The cell-free layer is thin relative to the tube diameter. Apparent viscosity approaches the bulk value.
-- **D ~ 10-50 um**: The cell-free layer occupies a significant fraction of the cross-section. Apparent viscosity can fall to less than half the bulk value.
-- **D ~ 5-7 um**: Viscosity reaches a minimum. Below this, red blood cells (diameter ~6-8 um but highly deformable) must squeeze single-file through the lumen, and viscosity rises steeply.
-- **D < 2.7 um**: Even maximally deformed RBCs cannot transit. Flow is effectively impossible.
+---
 
-### The Pries 1992 Model
+## Diagnostic scripts
 
-Pries, Neuhaus, and Gaehtgens (1992) compiled measurements of blood viscosity in glass tubes across a wide range of diameters (3.3-1978 um) and hematocrits (0-0.90). They fit a parametric model with three components:
+| script | purpose |
+|---|---|
+| `natural_flow_summary.jl` | minimal hemo-only report for a directory of tree CSVs; supports multiple configs in one invocation (loads each tree once, runs hemo per config) |
+| `tree_diagnostic.jl` | per-tree root R, path R statistics, diameter histogram |
+| `dead_segments_diag.jl` | CSV (parent-id) vs FlowTree (BFS) reachability + vertex merge histogram — used to find the original load_tree bug; useful for any new CSV producer |
+| `lcx_dead_flow_diag.jl` | per-segment flow distribution + top bottleneck list; useful when a tree gives unexpectedly low Q |
+| `xcat_label_dims.jl` | groups segments by `label` to spot anatomical kinks (e.g. an XCAT chain that narrows mid-way) |
+| `lad_stenosis_sweep.jl` + `plot_lad_stenosis.py` | proximal-LAD stenosis vs root flow (Gould curve) |
 
-1. A reference curve `eta_0.45(D)` for blood at 45% hematocrit.
-2. A diameter-dependent exponent `C(D)` that governs how viscosity scales with hematocrit.
-3. The full viscosity `eta(D, Hd)` interpolating between plasma (Hd=0) and the reference curve.
+All diagnostic scripts take the tree dir as `ARGS[1]` and never call
+`run_flow_simulation` — they're fast (~5 min) compared to the full pipeline.
 
-This in-vitro model accurately captures the Fahraeus-Lindqvist minimum and the steep rise at small diameters.
+---
 
-### The Endothelial Surface Layer (Pries & Secomb 2005)
+## Reproducing the canonical vmale50 coronary run
 
-Glass tubes lack the glycocalyx that lines living endothelium. In vivo, this endothelial surface layer (ESL) extends approximately 1.1 micrometers into the lumen, reducing the effective diameter available for flow. For a 20-micrometer vessel, this means the effective diameter is 17.8 micrometers -- and because Poiseuille resistance scales with the fourth power of radius, this raises resistance by `(20/17.8)^4 = 1.59` (a 59% increase).
+```bash
+# step 1: grow trees with VascularTreeSim (~6 h)
+cd ../VascularTreeSim.jl
+julia --project=. --threads=auto examples/run_coronary_growth.jl configs/coronary.toml
 
-The ESL correction is applied for diameters between 10 and 150 micrometers. Below 10 micrometers, the glycocalyx is compressed by transiting red blood cells and has minimal additional effect. Above 150 micrometers, the 1.1-micrometer layer is negligible relative to the lumen.
+# step 2: scale to at-rest (~7 min)
+for tree in lad lcx rca; do
+  julia --project=. scripts/scale_to_rest.jl \
+        output/${tree}_segments.csv \
+        output_at_rest/${tree}_segments.csv \
+        0.55
+done
 
-### Why This Matters
+# step 3: flow report for both states (~30 min)
+cd ../FlowContrastSim.jl
+julia --project=. scripts/natural_flow_summary.jl \
+      ../VascularTreeSim.jl/output_at_rest configs/coronary_baseline.toml
+julia --project=. scripts/natural_flow_summary.jl \
+      ../VascularTreeSim.jl/output configs/coronary_hyperemic.toml
+```
 
-Using a constant viscosity of 3.5 cP for all vessel sizes produces systematic errors:
+Expected (same numbers as the README's other repo):
 
-- **Overestimates resistance in 10-100 um vessels** by up to a factor of 2, because it ignores the Fahraeus-Lindqvist reduction.
-- **Underestimates resistance in 3-7 um vessels**, where single-file RBC transit dramatically increases effective viscosity.
-- **Ignores the ESL**, which adds 20-60% additional resistance in vessels of 10-50 micrometers.
+| tree | baseline (mL/min) | hyperemic (mL/min) | CFR |
+|---|---|---|---|
+| LAD | 47 | 166 | 3.5× |
+| LCX | 52 | 179 | 3.4× |
+| RCA | 57 | 196 | 3.4× |
+| total | **157** | **541** | — |
 
-In a tree with thousands of microvessels, these errors compound and can shift the total flow by 30-50%, alter the flow distribution at bifurcations, and produce incorrect transit times for contrast simulation.
+All three trees fall in the clinical bands (baseline 30–60 mL/min,
+hyperemic 120–240 mL/min, CFR 3–5×). Total flow matches population means
+(~150 mL/min at rest, 400–700 mL/min peak hyperemia).
 
 ---
 
 ## References
 
-1. **Pries AR, Neuhaus D, Gaehtgens P.** Blood viscosity in tube flow: dependence on diameter and hematocrit. *American Journal of Physiology -- Heart and Circulatory Physiology*. 1992;263(6):H1770-H1778. -- The foundational parameterization of in-vitro apparent blood viscosity as a function of tube diameter and hematocrit.
-
-2. **Pries AR, Secomb TW.** Microvascular blood viscosity in vivo and the endothelial surface layer. *American Journal of Physiology -- Heart and Circulatory Physiology*. 2005;289(6):H2657-H2664. -- Extension of the 1992 model to account for the endothelial glycocalyx layer that reduces effective lumen diameter in vivo.
-
-3. **Molloi S, et al.** Estimation of coronary artery hyperemic blood flow based on arterial lumen volume using angiographic images. *International Journal of Cardiovascular Imaging*. 2007. -- Basis for the target hyperemic flow rates used in calibration.
-
-4. **Wong JT, et al.** Quantification of fractional flow reserve based on angiographic image data. *International Journal of Cardiovascular Imaging*. 2008. -- Related work on flow quantification from angiographic data.
-
-5. **Fahraeus R, Lindqvist T.** The viscosity of the blood in narrow capillary tubes. *American Journal of Physiology*. 1931;96(3):562-568. -- Original observation of the diameter-dependent viscosity reduction in narrow tubes.
+- Murray CD. "The physiological principle of minimum work…" PNAS 1926
+- Pries AR et al. "Blood viscosity in tube flow: dependence on diameter
+  and hematocrit." Am J Physiol 1992;263:H1770-8
+- Pries AR, Secomb TW. "Microvascular blood viscosity in vivo and the
+  endothelial surface layer." Am J Physiol 2005;289:H2657-64
+- Dodge JT et al. "Lumen diameter of normal human coronary arteries:
+  influence of age, sex, anatomic variation, and left ventricular
+  hypertrophy." Circulation 1992;86:232-46
+- Gould KL. "Pressure-flow characteristics of coronary stenoses in
+  unsedated dogs at rest and during coronary vasodilation." Circ Res 1978

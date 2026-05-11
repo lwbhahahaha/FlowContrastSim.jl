@@ -14,6 +14,12 @@ output_*/
 # Per-run logs emitted by scripts/natural_flow_summary.jl and friends
 *.log
 
+# Plot / CSV outputs emitted by diagnostic scripts (keep .jl / .py themselves)
+scripts/*.csv
+scripts/*.png
+scripts/*.svg
+scripts/*.pdf
+
 # Test-generated artifacts
 test/output/
 

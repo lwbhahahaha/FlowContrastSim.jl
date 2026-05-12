@@ -39,7 +39,10 @@ const cfg_base    = splitext(basename(CONFIG_PATH))[1]
 const OUT_CSV     = length(ARGS) >= 3 ? ARGS[3] : "scripts/lad_stenosis_$(cfg_base).csv"
 
 const PROXIMAL_LABEL = "dias_lad1"
-const STENOSIS_PCTS = 0.0:10.0:90.0
+# Default 0,10,...,90. Override via ARGS[4] = comma-separated list, e.g. "82,84,86,88,92,94,96,98".
+const STENOSIS_PCTS = length(ARGS) >= 4 ?
+    sort(parse.(Float64, split(ARGS[4], ','))) :
+    collect(0.0:10.0:90.0)
 
 cfg = load_flow_config(CONFIG_PATH)
 mass_lad = get(cfg.territory_masses_g, "LAD", 0.0)

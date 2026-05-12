@@ -89,14 +89,15 @@ def main():
 
     ax.set_xlabel("Proximal LAD stenosis (%)", fontsize=12)
     ax.set_ylabel("LAD root flow (mL/min)", fontsize=12)
-    ax.set_xlim(-3, 93)
+    max_x = max(r[0] for _, rows in series for r in rows)
+    ax.set_xlim(-3, max_x + 3)
     ax.set_ylim(0, max_q * 1.10)
-    ax.set_xticks(range(0, 100, 10))
+    ax.set_xticks(range(0, int(max_x) + 2, 10))
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=11, loc="upper right")
 
     # clinical-significant threshold
-    ax.axvspan(70, 93, color="#ffe5e5", alpha=0.4, zorder=0)
+    ax.axvspan(70, max_x + 3, color="#ffe5e5", alpha=0.4, zorder=0)
     ax.axvline(70, color="#b03030", linestyle="--", linewidth=1.0, alpha=0.6)
     ax.text(71, max_q * 0.94, "clinically significant\n(≥70% stenosis)", color="#8a2020", fontsize=9)
 

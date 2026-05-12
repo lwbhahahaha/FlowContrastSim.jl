@@ -53,7 +53,12 @@ const cfg_base    = splitext(basename(CONFIG_PATH))[1]
 const OUT_CSV     = length(ARGS) >= 3 ? ARGS[3] : "scripts/lad_stenosis_autoreg_$(cfg_base).csv"
 
 const PROXIMAL_LABEL = "dias_lad1"
-const STENOSIS_PCTS  = 0.0:10.0:90.0
+# Default 0,10,...,90. Override via ARGS[4] = comma-separated list (e.g. "82,84,86,88,92,94,96,98").
+# s=0 is always computed internally for the model fit (Q_target + Q(s=0, F_MAX));
+# it appears in the output CSV only if 0 ∈ user list.
+const STENOSIS_PCTS  = length(ARGS) >= 4 ?
+    sort(parse.(Float64, split(ARGS[4], ','))) :
+    collect(0.0:10.0:90.0)
 
 const D_LOW_UM       = 8.0       # Wong-Molloi resistance band lower
 const D_HIGH_UM      = 400.0     # Wong-Molloi resistance band upper

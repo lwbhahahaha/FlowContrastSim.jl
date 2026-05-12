@@ -15,7 +15,12 @@
 root_pressure_mmhg = 100.0
 terminal_pressure_mmhg = 15.0
 discharge_hematocrit = 0.45
-capillary_bed_R_per_100g_mmHgmin_ml = 0.15
+# Hyperemic state: cap bed R slightly below the strict Pries-Secomb literature
+# value (0.15), modeling residual autoregulatory relaxation of the cap bed +
+# venous return during max vasodilation. Combined with the arteriolar dilation
+# in the (at-rest → max-dilated) geometry diff (tone 0.4 → 1.67x diameter
+# reserve), this brings total CFR to ~4 — Gould-curve midline.
+capillary_bed_R_per_100g_mmHgmin_ml = 0.12
 dt = 0.1
 t_end = 20.0
 max_arrival_s = 15.0

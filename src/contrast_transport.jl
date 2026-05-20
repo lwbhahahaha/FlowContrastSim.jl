@@ -15,14 +15,21 @@ Holds time-resolved contrast concentration.
 
 The sparse variant lets us run contrast simulation on 25M+ segment 8 μm trees
 without allocating a 40 GB matrix per tree.
+
+`arrival_s` is the physical bolus arrival time in seconds, computed from the
+hemodynamics-derived per-segment transit times via topological BFS. Length is
+`length(tree.segment_start)` (full tree, NOT filtered) so downstream consumers
+can index by segment_id directly. Unreachable / zero-flow segments are `Inf`.
 """
 struct ContrastResult
     times::Vector{Float64}                # seconds
     concentration::Matrix{Float64}        # [n_rows x n_timesteps] mg/mL
     outlet_concentration::Matrix{Float64} # [n_rows x n_timesteps] mg/mL
     segment_ids::Vector{Int}              # empty ⇒ dense (row i == segment i)
+    arrival_s::Vector{Float64}            # length n_seg full tree; Inf = unreachable
 end
-ContrastResult(times, C, Cout) = ContrastResult(times, C, Cout, Int[])
+ContrastResult(times, C, Cout) = ContrastResult(times, C, Cout, Int[], Float64[])
+ContrastResult(times, C, Cout, sids) = ContrastResult(times, C, Cout, sids, Float64[])
 
 # ── Gamma-variate input curve (classic bolus) ──
 function gamma_variate_input(times::Vector{Float64};
@@ -81,7 +88,29 @@ function _compute_arrival_times(tree::FlowTree, hemo::HemodynamicsResult)
     return arrival
 end
 
-# ── Plug-flow contrast simulation with time compression for visualization ──
+# ── Plug-flow contrast simulation ──
+#
+# Physics:
+#   - Per-segment arrival[s] is the cumulative transit time along the path from
+#     the root to segment s's midpoint, computed from hemodynamics
+#     (vol[s] / |flow[s]|) via topological BFS. No log-compression, no
+#     calibration — what falls out of Poiseuille + Pries viscosity + the
+#     downstream capillary-bed R is what we use.
+#   - At segment s, C_s(t) = C_root(t - arrival[s], dispersed). Dispersion
+#     stretches the bolus in time by disp_factor and rescales amplitude by
+#     1/disp_factor to preserve mass (Gaussian-ish, but applied to the gamma
+#     shape — a common in-vivo empirical approximation):
+#         disp_factor = sqrt(1 + arrival / t_dispersion_s)
+#     The dispersion time scale `t_dispersion_s` is empirical for branching
+#     pulsatile vasculature (≈ 1–3 s in vivo coronary; configurable per call /
+#     per config).
+#   - Unreachable / zero-flow segments keep arrival=Inf ⇒ identically zero
+#     contrast (physical: no flow means no contrast delivered).
+#
+# `max_arrival_s` is accepted as a kwarg for API stability but is IGNORED —
+# previously it drove a log-compression of arrival times into a fixed window,
+# which was a visualization hack that contaminated the peak-time estimate and
+# downstream voxelization. Real physics now governs arrival end-to-end.
 function simulate_contrast(tree::FlowTree, hemo::HemodynamicsResult;
                            dt::Float64=0.05,
                            t_end::Float64=30.0,
@@ -90,7 +119,8 @@ function simulate_contrast(tree::FlowTree, hemo::HemodynamicsResult;
                            t0::Float64=0.5,
                            tmax::Float64=4.0,
                            alpha::Float64=3.0,
-                           max_arrival_s::Float64=0.0,
+                           max_arrival_s::Float64=0.0,        # accepted but ignored (see note above)
+                           t_dispersion_s::Float64=3.0,
                            min_diameter_um::Float64=0.0)
     nseg = length(tree.segment_start)
     times = collect(0.0:dt:t_end)
@@ -107,45 +137,15 @@ function simulate_contrast(tree::FlowTree, hemo::HemodynamicsResult;
     end
     nrows = isempty(segment_ids) ? nseg : length(segment_ids)
 
-    # Compute raw arrival times
-    arrival_raw = _compute_arrival_times(tree, hemo)
+    # Physical arrival times (no log-compression, no calibration)
+    arrival = _compute_arrival_times(tree, hemo)
 
-    # Compress arrival times: map [0, p99_arrival] -> [0, effective_window]
-    finite_arr = sort(arrival_raw[isfinite.(arrival_raw)])
-    if isempty(finite_arr)
-        return ContrastResult(times, zeros(nrows, nt), zeros(nrows, nt), segment_ids)
-    end
-
-    # Auto-determine max arrival if not specified
-    if max_arrival_s <= 0
-        # Use t_end - bolus_peak as the window for contrast to fill tree
-        max_arrival_s = t_end - tmax
-    end
-
-    # Use p99 as the reference for compression
-    p99_raw = length(finite_arr) > 10 ? finite_arr[min(length(finite_arr), Int(ceil(0.99 * length(finite_arr))))] : finite_arr[end]
-    p99_raw = max(p99_raw, 1.0)
-
-    # Log-compress: arrival_compressed = max_arrival * log(1 + arrival_raw/scale) / log(1 + p99/scale)
-    # scale controls how much compression (smaller = more compression of large values)
-    scale = max(finite_arr[max(1, length(finite_arr) / 4 |> x -> Int(ceil(x)))], 0.1)  # p25 as scale
-    log_norm = log(1.0 + p99_raw / scale)
-
-    arrival = fill(Inf, nseg)
-    for s in 1:nseg
-        isfinite(arrival_raw[s]) || continue
-        arrival[s] = max_arrival_s * log(1.0 + arrival_raw[s] / scale) / log_norm
-    end
-
-    # Gamma-variate input
+    # Gamma-variate input (informational; the per-segment loop samples it directly below)
     C_root = if root_input !== nothing
         root_input
     else
         gamma_variate_input(times; amplitude=amplitude, t0=t0, tmax=tmax, alpha=alpha)
     end
-
-    # Dispersion broadening
-    t_disp = 3.0  # seconds
 
     # Concentration arrays (sized by nrows: either full nseg, or filtered subset)
     C = zeros(nrows, nt)
@@ -154,17 +154,17 @@ function simulate_contrast(tree::FlowTree, hemo::HemodynamicsResult;
     # Iterate over rows of the output matrix, mapping row → tree segment index.
     @inbounds for i in 1:nrows
         s = isempty(segment_ids) ? i : segment_ids[i]
-        !isfinite(arrival[s]) && continue
+        a = arrival[s]
+        !isfinite(a) && continue
 
+        disp_factor = sqrt(1.0 + a / t_dispersion_s)
         for ti in 1:nt
             t = times[ti]
-            t_shifted = t - arrival[s]
+            t_shifted = t - a
             t_shifted <= 0 && continue
 
-            # Apply dispersion: broader bolus for deeper segments
-            disp_factor = sqrt(1.0 + arrival[s] / t_disp)
-
-            # Sample dispersed input curve
+            # Sample dispersed bolus: time axis stretched by disp_factor,
+            # amplitude rescaled by 1/disp_factor (preserves area under curve).
             t_input = t0 + (t_shifted - t0) / disp_factor
             if t_input > t0
                 tp = (t_input - t0) / (tmax - t0)
@@ -177,5 +177,5 @@ function simulate_contrast(tree::FlowTree, hemo::HemodynamicsResult;
         end
     end
 
-    return ContrastResult(times, C, C_out, segment_ids)
+    return ContrastResult(times, C, C_out, segment_ids, arrival)
 end

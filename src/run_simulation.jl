@@ -92,7 +92,7 @@ function run_flow_simulation(tree_csv_dir::String, config::FlowConfig;
                                t0=config.contrast_t0,
                                tmax=config.contrast_tmax,
                                alpha=config.contrast_alpha,
-                               max_arrival_s=config.max_arrival_s,
+                               t_dispersion_s=config.contrast_t_dispersion_s,
                                min_diameter_um=config.contrast_min_diameter_um)
         nsim = size(cr.concentration, 1)
         println("[flow] [$(name)] contrast in $(round(time()-t2,digits=1))s; simulated $(nsim) segments; peak=$(round(maximum(cr.concentration),digits=2)) mg/mL"); flush(stdout)

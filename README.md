@@ -130,6 +130,25 @@ matrix. Without this a 110 M-segment LCX would need ~50 GB just for the
 contrast field. Hemodynamics (R + flow + transit time) is still computed for
 every segment.
 
+**Real physical arrival times (no log-compression).** `simulate_contrast`
+uses `_compute_arrival_times` directly — the bolus arrival at each
+segment is the hemodynamics-derived `vol/flow` cumulative transit (via
+topological BFS) with no truncation or rescaling. Previous releases applied
+a "log-compress to [0, max_arrival_s]" hack for visualization which
+contaminated the peak-time estimate and downstream voxelization; that hack
+is removed. `max_arrival_s` is still accepted as a kwarg for API
+compatibility but silently ignored. Per-segment dispersion is
+`disp_factor = sqrt(1 + arrival / t_dispersion_s)` with
+`t_dispersion_s` configurable via `contrast_t_dispersion_s` in the TOML
+(default 3 s, an in-vivo coronary empirical value).
+
+**`ContrastResult.arrival_s`.** Each `ContrastResult` now carries a
+length-`n_seg` `arrival_s::Vector{Float64}` of physical arrival times.
+`extract_peak_iodine.jl` writes this as a Float32 `{tree}_arrival_time.f32`
+alongside `{tree}_peak_iodine.f32` — consumed by the perfusion pipeline's
+`make_basissim_phantoms.jl --use-myo-arrival` and the standalone
+`simple_dynamic_viewer.jl`.
+
 ---
 
 ## Installation
@@ -194,14 +213,16 @@ discharge_hematocrit  = 0.45
 # physics-grounded downstream R (Pries-Secomb in-vivo for myocardium):
 capillary_bed_R_per_100g_mmHgmin_ml = 0.15   # 0.12 in coronary_hyperemic.toml
 
-# contrast bolus shape (gamma-variate)
+# contrast bolus shape (gamma-variate) — used as the synthetic root input.
+# For real patient AIF, see ../perfusion_pipeline/scripts/step0_prepare_aif.py
 contrast_amplitude = 5.0   # mg I / mL peak
 contrast_t0   = 0.5        # s onset
 contrast_tmax = 4.0        # s peak
 contrast_alpha = 3.0       # shape
+contrast_t_dispersion_s = 3.0   # bolus dispersion timescale: disp = sqrt(1 + a/t_disp)
 dt    = 0.1                # s — simulation timestep
 t_end = 20.0               # s
-max_arrival_s = 15.0       # truncate plug-flow arrival lookup
+max_arrival_s = 15.0       # LEGACY — accepted but ignored after the log-compress fix
 contrast_min_diameter_um = 50.0   # skip contrast on segs below this diameter
 
 # per-tree territory mass for cap_R parallel→series conversion
@@ -276,6 +297,9 @@ play/pause + per-segment hover.
 | `xcat_label_dims.jl` | groups segments by `label` to spot anatomical kinks (e.g. an XCAT chain that narrows mid-way) |
 | `lad_stenosis_sweep.jl` + `plot_lad_stenosis.py` | proximal-LAD stenosis vs root flow at fixed dilation state (Gould curve); accepts a comma-separated stenosis list via `ARGS[4]` |
 | `lad_stenosis_autoreg_sweep.jl` + `plot_autoreg_dilation.py` | closed-loop autoregulation: solves analytically for the arteriolar dilation factor that maintains target Q as stenosis grows, up to the 1.6× reserve cap |
+| `extract_peak_iodine.jl` | run hemo + simulate_contrast for each tree, find global peak time, write per-segment peak iodine + per-segment `arrival_time.f32` (consumed by `simple_dynamic_viewer.jl` and the perfusion-pipeline voxelizer) |
+| `simple_dynamic_viewer.jl` | standalone dynamic-contrast HTML viewer at the ≥500 μm "main artery" level. Reads `arrival_time.f32` if present (physical hemo arrival); falls back to a Murray-velocity v(s) = v_root · D_s/D_root model. Does **not** use FlowContrastSim's runtime so it scales to the 357 M-segment phantom-grown trees that would OOM `build_contrast_viewer` |
+| `build_dynamic_contrast_viewer.jl` | full-runtime viewer (calls `build_contrast_viewer`); reduced budgets via `max_segments_per_branch = 800` + `time_stride = 10`. OOMs on the very largest 110 M-segment trees; use `simple_dynamic_viewer.jl` instead in that case |
 
 All diagnostic scripts take the tree dir as `ARGS[1]` and never call
 `run_flow_simulation` — they're fast (~5 min) compared to the full pipeline.

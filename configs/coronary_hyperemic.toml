@@ -23,11 +23,17 @@ discharge_hematocrit = 0.45
 capillary_bed_R_per_100g_mmHgmin_ml = 0.12
 dt = 0.1
 t_end = 20.0
+# max_arrival_s is legacy (was the log-compress target window); now ignored.
+# simulate_contrast uses the raw hemo-derived per-segment arrival times.
 max_arrival_s = 15.0
 contrast_amplitude = 5.0
 contrast_t0 = 0.5
 contrast_tmax = 4.0
 contrast_alpha = 3.0
+# Empirical bolus dispersion time scale. disp_factor = sqrt(1 + arrival/t_disp).
+# In-vivo coronary measurements give ~1–3 s; 3 s is a conservative default.
+# This is empirical (branching + pulsatile flow mixing), not a calibration knob.
+contrast_t_dispersion_s = 3.0
 contrast_min_diameter_um = 50.0
 
 [territory_masses_g]

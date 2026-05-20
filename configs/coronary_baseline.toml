@@ -19,11 +19,14 @@ discharge_hematocrit = 0.45
 capillary_bed_R_per_100g_mmHgmin_ml = 0.15
 dt = 0.1
 t_end = 20.0
+# max_arrival_s is legacy (was the log-compress target window); now ignored.
 max_arrival_s = 15.0
 contrast_amplitude = 5.0
 contrast_t0 = 0.5
 contrast_tmax = 4.0
 contrast_alpha = 3.0
+# Empirical bolus dispersion time scale. See coronary_hyperemic.toml.
+contrast_t_dispersion_s = 3.0
 contrast_min_diameter_um = 50.0
 
 [territory_masses_g]

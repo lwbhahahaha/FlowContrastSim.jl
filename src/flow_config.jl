@@ -15,9 +15,10 @@ struct FlowConfig
     contrast_t0::Float64
     contrast_tmax::Float64
     contrast_alpha::Float64
+    contrast_t_dispersion_s::Float64    # empirical bolus broadening time scale (s); ≈1–3 in vivo coronary
     dt::Float64
     t_end::Float64
-    max_arrival_s::Float64
+    max_arrival_s::Float64               # legacy, accepted but ignored by simulate_contrast
     contrast_min_diameter_um::Float64  # 0 = simulate every segment; >0 = skip smaller (saves memory on 8 μm trees)
 end
 
@@ -54,6 +55,7 @@ function load_flow_config(path::String)
         Float64(get(d, "contrast_t0", 0.5)),
         Float64(get(d, "contrast_tmax", 4.0)),
         Float64(get(d, "contrast_alpha", 3.0)),
+        Float64(get(d, "contrast_t_dispersion_s", 3.0)),
         Float64(get(d, "dt", 0.1)),
         Float64(get(d, "t_end", 20.0)),
         Float64(get(d, "max_arrival_s", 15.0)),

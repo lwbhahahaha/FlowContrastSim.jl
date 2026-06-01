@@ -1,21 +1,55 @@
 # ── Top-level orchestration: load trees, compute flow, simulate contrast ──
 
 """
-    run_flow_simulation(tree_csv_dir, config; output_dir="output") -> NamedTuple
+    run_flow_simulation(tree_csv_dir, config; output_dir, injection_protocol, patient_physiology)
+        -> NamedTuple
 
 Run the full flow simulation pipeline:
 1. Auto-discover and load tree CSVs from directory
 2. Compute hemodynamics for each tree
-3. Simulate contrast transport
-4. Build HTML viewer
-5. Return results
+3. Synthesize AIF from `config.injection_protocol` + `config.patient_physiology`
+   (when set). Per-run overrides take precedence over the TOML defaults:
+       run_flow_simulation(dir, cfg; injection_protocol=UniphaseNoChaser(weight_kg=90.0))
+4. Simulate contrast transport
+5. Build HTML viewer
+6. Return results
 
 CSV files are discovered by matching `*_segments.csv` or `*.csv` in the directory.
 Branch names are extracted from filenames (e.g., `lad_grown_segments.csv` -> `LAD`).
+
+Pass `injection_protocol=nothing` to force the legacy gamma-variate input
+(useful for ablation studies / backward-compatible reproductions).
 """
 function run_flow_simulation(tree_csv_dir::String, config::FlowConfig;
-                             output_dir::String="output")
+                             output_dir::String="output",
+                             injection_protocol::Union{Nothing, AbstractInjectionProtocol, Missing}=missing,
+                             patient_physiology::Union{PatientPhysiology, Missing}=missing,
+                             peak_time_s::Union{Nothing, Float64}=nothing)
     mkpath(output_dir)
+
+    # Resolve protocol / physiology: kwarg wins, then config, then default.
+    eff_protocol = injection_protocol === missing ? config.injection_protocol : injection_protocol
+    eff_physiology = patient_physiology === missing ? config.patient_physiology : patient_physiology
+
+    # Build AIF from protocol if one is set. AIF is shared across all
+    # three trees (they all branch off the aorta root).
+    aif_vec = nothing
+    if eff_protocol !== nothing
+        _, aif_vec = protocol_to_aif(eff_protocol, eff_physiology;
+                                      dt=config.dt, t_max=config.t_end)
+        peak_val = maximum(aif_vec)
+        peak_idx = argmax(aif_vec)
+        peak_t   = (peak_idx - 1) * config.dt
+        auc      = sum(aif_vec) * config.dt
+        println("[flow] Protocol: $(typeof(eff_protocol).name.name)")
+        println("[flow]   $(eff_protocol)")
+        println("[flow]   Physiology: CO=$(eff_physiology.cardiac_output_ml_s) mL/s, transit peak=$(eff_physiology.central_transit_delay_s)s, dispersion=$(eff_physiology.central_transit_dispersion_s)s")
+        println("[flow]   AIF: peak=$(round(peak_val, digits=3)) mgI/mL at t=$(round(peak_t, digits=2))s, AUC=$(round(auc, digits=2)) mgI·s/mL")
+        flush(stdout)
+    else
+        println("[flow] No injection_protocol set — falling back to legacy gamma-variate root input.")
+        flush(stdout)
+    end
 
     # ── 1. Auto-discover and load tree CSVs ──
     println("[flow] Discovering tree CSVs in: $(tree_csv_dir)")
@@ -88,6 +122,9 @@ function run_flow_simulation(tree_csv_dir::String, config::FlowConfig;
         cr = simulate_contrast(tree, hemo;
                                dt=config.dt,
                                t_end=config.t_end,
+                               aif=aif_vec,
+                               D_mol_m2_s=config.D_mol_m2_s,
+                               peak_time_s=peak_time_s,
                                amplitude=config.contrast_amplitude,
                                t0=config.contrast_t0,
                                tmax=config.contrast_tmax,
@@ -128,7 +165,11 @@ function run_flow_simulation(tree_csv_dir::String, config::FlowConfig;
         target = get(config.target_flows_ml_min, name, 0.0)
         println("  $(name): $(round(root_flow*60*1e6, digits=1)) mL/min (target=$(target))")
     end
-    println("Contrast: gamma-variate bolus, $(config.contrast_amplitude) mg/mL")
+    if eff_protocol !== nothing
+        println("Contrast input: $(typeof(eff_protocol).name.name) → AIF (gamma-variate central kernel)")
+    else
+        println("Contrast input: legacy gamma-variate (amplitude=$(config.contrast_amplitude))")
+    end
     println("="^60)
 
     return (
@@ -136,5 +177,8 @@ function run_flow_simulation(tree_csv_dir::String, config::FlowConfig;
         hemo_results=hemo_results,
         contrast_results=contrast_results,
         viewer_path=viewer_path,
+        aif=aif_vec,
+        protocol=eff_protocol,
+        physiology=eff_physiology,
     )
 end

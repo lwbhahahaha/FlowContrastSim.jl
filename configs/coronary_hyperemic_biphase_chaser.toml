@@ -1,0 +1,54 @@
+# Coronary flow + dynamic contrast — hyperemic, BIPHASE injection + chaser.
+#
+# Same hyperemic physics as `coronary_hyperemic_uniphase.toml`, with the
+# clinical 2-phase + saline chaser protocol that's common for cardiac CT
+# angiography (CTCA): fast loading phase delivers a dense aortic bolus,
+# slower sustaining phase keeps it from washing out, then a diluted
+# saline chaser pushes the residual contrast out of peripheral veins
+# (mixed bolus = 30 % contrast / 70 % saline so the right-heart artifact
+# is suppressed without losing the chaser push).
+
+# ── Hemodynamics ──
+root_pressure_mmhg = 100.0
+terminal_pressure_mmhg = 15.0
+discharge_hematocrit = 0.45
+capillary_bed_R_per_100g_mmHgmin_ml = 0.12
+
+# ── Time grid for contrast simulation ──
+dt = 0.1
+t_end = 60.0
+contrast_min_diameter_um = 50.0
+# Legacy field; ignored on the AIF / PDE path.
+contrast_t_dispersion_s = 3.0
+D_mol_m2_s = 1.5e-9
+
+[territory_masses_g]
+LAD = 58.9
+LCX = 60.9
+RCA = 63.8
+
+[target_flows_ml_min]
+LAD = 200.0
+LCX = 150.0
+RCA = 190.0
+
+# ── Contrast injection protocol — biphase + chaser ──
+# Phase 1: 0.4 mL/kg at 6 mL/s  → fast loading
+# Phase 2: 0.4 mL/kg at 3 mL/s  → slow sustain
+# Chaser : 0.5 mL/kg at 3 mL/s, 30 % contrast / 70 % saline
+[injection_protocol]
+type = "BiphaseWithChaser"
+weight_kg = 70.0
+contrast_concentration_mgI_ml = 370.0
+phase1_volume_per_kg = 0.4
+phase1_rate_ml_s = 6.0
+phase2_volume_per_kg = 0.4
+phase2_rate_ml_s = 3.0
+chaser_volume_per_kg = 0.5
+chaser_rate_ml_s = 3.0
+chaser_dilution = 0.30
+
+[patient_physiology]
+cardiac_output_ml_s = 83.0
+central_transit_delay_s = 12.0
+central_transit_dispersion_s = 3.0

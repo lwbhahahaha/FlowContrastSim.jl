@@ -35,6 +35,7 @@ using Statistics
 using TOML
 
 include("flow_tree.jl")
+include("protocol.jl")
 include("flow_config.jl")
 include("hemodynamics.jl")
 include("contrast_transport.jl")
@@ -45,14 +46,26 @@ include("run_simulation.jl")
 export FlowTree,
        FlowConfig,
        HemodynamicsResult,
-       ContrastResult
+       ContrastResult,
+       AbstractInjectionProtocol,
+       UniphaseNoChaser,
+       UniphaseWithChaser,
+       BiphaseNoChaser,
+       BiphaseWithChaser,
+       PatientPhysiology
+
+# ── Injection protocols ──
+export injection_profile,
+       central_transit_kernel,
+       protocol_to_aif
 
 # ── Tree loading ──
 export load_tree,
        load_trees
 
 # ── Config ──
-export load_flow_config
+export load_flow_config,
+       with_protocol
 
 # ── Hemodynamics ──
 export compute_hemodynamics,

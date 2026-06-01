@@ -130,17 +130,71 @@ matrix. Without this a 110 M-segment LCX would need ~50 GB just for the
 contrast field. Hemodynamics (R + flow + transit time) is still computed for
 every segment.
 
-**Real physical arrival times (no log-compression).** `simulate_contrast`
-uses `_compute_arrival_times` directly — the bolus arrival at each
-segment is the hemodynamics-derived `vol/flow` cumulative transit (via
-topological BFS) with no truncation or rescaling. Previous releases applied
-a "log-compress to [0, max_arrival_s]" hack for visualization which
-contaminated the peak-time estimate and downstream voxelization; that hack
-is removed. `max_arrival_s` is still accepted as a kwarg for API
-compatibility but silently ignored. Per-segment dispersion is
-`disp_factor = sqrt(1 + arrival / t_dispersion_s)` with
-`t_dispersion_s` configurable via `contrast_t_dispersion_s` in the TOML
-(default 3 s, an in-vivo coronary empirical value).
+**Real physical arrival times (no log-compression).** Bolus arrival at
+each segment is the hemodynamics-derived `vol/flow` cumulative transit
+(via topological BFS) — no truncation or rescaling. Previous releases
+applied a "log-compress to [0, max_arrival_s]" hack for visualization
+which contaminated the peak-time estimate and downstream voxelization;
+that hack is removed. `max_arrival_s` is still accepted as a kwarg for
+API compatibility but silently ignored.
+
+**Taylor-Aris analytical PDE solution (when an AIF is provided).** With a
+protocol-derived AIF on the root, the contrast field on every segment is
+the exact path-integrated Green's-function solution of the 1D advection-
+dispersion equation:
+
+```
+C_s(t)   = (AIF ⊛ G_{μ_s, σ_s})(t)
+μ_s     = Σ_{ancestors} τ_a   + τ_s / 2
+σ_s²    = Σ_{ancestors} σ_a²  + σ_seg_s² / 2
+σ_seg²  = 2 D_eff(R, v) × L / v³
+D_eff   = D_mol + (R v)² / (48 D_mol)        # Taylor 1953 / Aris 1956
+```
+
+Per-segment mean and variance accumulate together in a single BFS pass.
+Mass conservation is exact (∫C_s(t) dt = ∫AIF dt for every reachable
+segment) because the Gaussian convolution is unit-area.
+
+What this physics gives you that the empirical `sqrt(1 + a/t_dispersion_s)`
+formula didn't (= why we bothered to swap):
+
+- **No tuned dispersion constant.** Dispersion is derived from the
+  segment's radius, length, velocity, and the iodine molecular diffusivity
+  `D_mol_m2_s` (default 1.5e-9, iohexol/iomeprol in plasma at 37 °C). The
+  knob `t_dispersion_s` becomes legacy — only consulted when no AIF is
+  supplied. Aligns with the project's "no calibration" rule.
+- **Different protocols produce physically correct downstream
+  differences.** A sharper injection (high rate, low volume) gives a
+  sharper AIF; the new path preserves that sharpness in proximal segments
+  and smears it in deeper segments by an amount determined by the actual
+  tree geometry. The old `sqrt` formula erased protocol-to-protocol
+  differences after a few seconds of transit, regardless of geometry.
+- **Per-tree and per-state dispersion emerges automatically.** LAD, LCX,
+  RCA have different path-length distributions → their effective AIF →
+  tissue transfer functions differ. At-rest vs hyperemic geometries
+  (Wong-Molloi scaling) shift arteriolar velocities → Taylor variance
+  scales correctly. The previous `t_dispersion_s` was a single global
+  number that ignored both effects.
+- **Closed-loop validation with perfusion_pipeline becomes meaningful.**
+  When `basis_simulator` renders volumes and the perfusion pipeline
+  re-measures AIF + tissue curves to recover MBF, the relationship
+  between them is now governed by true physics (anatomy + diffusion). With
+  an empirical dispersion knob, any recovered "transit dispersion" would
+  just be the knob value rather than physiology.
+- **Stenosis sweeps make sense.** Stenosis changes velocities by orders
+  of magnitude in the affected branch. Taylor variance scales as
+  `~v²·L/v³ = L/v`, so dispersion responds correctly to velocity changes.
+  `sqrt(1 + a/t_disp)` was nearly velocity-independent and gave the same
+  smear regardless of obstruction.
+
+What it does *not* change: root flow (set by hemodynamics, not contrast),
+arrival-time means (pure advection, already exact in the previous code),
+or peak time at the root segment (≈ AIF peak time, regardless of model).
+The differences accumulate downstream.
+
+The legacy gamma-variate path with `contrast_t_dispersion_s` is still the
+default when no `[injection_protocol]` is present in the config — for
+backward compatibility with old configs and ablation studies.
 
 **`ContrastResult.arrival_s`.** Each `ContrastResult` now carries a
 length-`n_seg` `arrival_s::Vector{Float64}` of physical arrival times.
@@ -148,6 +202,63 @@ length-`n_seg` `arrival_s::Vector{Float64}` of physical arrival times.
 alongside `{tree}_peak_iodine.f32` — consumed by the perfusion pipeline's
 `make_basissim_phantoms.jl --use-myo-arrival` and the standalone
 `simple_dynamic_viewer.jl`.
+
+**Protocol-driven AIF (mgI/mL).** The legacy `(contrast_t0, contrast_tmax,
+contrast_amplitude, contrast_alpha)` knobs are a hand-tuned gamma-variate
+with no physical units. The new path in `src/protocol.jl` synthesizes the
+AIF at the aorta root from a clinical injection protocol +
+patient-physiology parameters:
+
+```
+protocol (vol/rate/conc)  →  injection_profile(t)     mgI/s into peripheral vein
+                          ⊛  central_transit_kernel    gamma-variate impulse response
+                                                       of RV → lung → LV → aorta
+                          ÷  cardiac_output_ml_s       → AIF(t) in mgI/mL
+```
+
+The central-transit kernel is a *lumped phenomenological* gamma-variate
+(peak time + dispersion), not a chamber-by-chamber mechanistic model —
+matches the agreed scope: we do not solve PDEs in the chambers, only in
+the three coronary trees. Mass conservation is exact: ∫AIF dt =
+total_injected_iodine / cardiac_output.
+
+Currently supported protocols (subtypes of `AbstractInjectionProtocol`):
+
+| protocol              | phases                                                       | extra fields beyond uniphase                                                                       |
+|-----------------------|--------------------------------------------------------------|----------------------------------------------------------------------------------------------------|
+| `UniphaseNoChaser`    | one rectangular pulse                                        | (none)                                                                                              |
+| `UniphaseWithChaser`  | contrast pulse → chaser (saline or mixed)                    | `chaser_volume_per_kg`, `chaser_rate_ml_s`, `chaser_dilution`                                       |
+| `BiphaseNoChaser`     | two contrast pulses at different rates                       | `phase1_volume_per_kg`, `phase1_rate_ml_s`, `phase2_volume_per_kg`, `phase2_rate_ml_s`              |
+| `BiphaseWithChaser`   | two contrast pulses → chaser                                 | both biphase fields + the three chaser fields above                                                 |
+
+All four share `weight_kg` and `contrast_concentration_mgI_ml` (default
+370 mgI/mL ≈ Iomeron 370). `chaser_dilution` is the iodine fraction of
+the chaser (0 = pure saline, 0.30 = 30 % contrast / 70 % saline mixed
+bolus, 1.0 = pure contrast). All defaults are TCGA-typical clinical
+values.
+
+Phase concatenation uses **proportional boundary blending** (the sample
+at a phase boundary is the area-weighted mix of the two phases' fluxes
+over its `dt`-wide interval), so the rectangle-rule integral is exact:
+`∫ injection_profile dt = total_injected_iodine` regardless of whether
+each phase's duration is an integer multiple of `dt`.
+
+Adding more schemes (e.g. arterial-phase bolus shaping for stenosis
+studies) is three small edits: define a new `<: AbstractInjectionProtocol`
+struct, list its phases as `(volume_ml, rate_ml_s, concentration_mgI_ml)`
+tuples in an `injection_profile(p)` method, and add one `elseif` to
+`_parse_injection_protocol`. `protocol_to_aif`, `central_transit_kernel`,
+and the Taylor-Aris solver dispatch generically and do not need editing.
+
+When `[injection_protocol]` is present in the TOML (or a protocol is
+passed to `run_flow_simulation` via kwarg), AIF is built once and shared
+across all three trees, then fed as the root boundary condition to the
+**Taylor-Aris analytical PDE solver** described above. The legacy
+gamma-variate knobs and the empirical `sqrt(1+a/t_disp)` dispersion
+become fallback only — used when the protocol section is absent. AIF
+unit is **mgI/mL** consistently through the pipeline, so the contrast
+field can flow directly into `basis_simulator` material decomposition
+without rescaling.
 
 ---
 
@@ -201,6 +312,98 @@ result = run_flow_simulation("../VascularTreeSim.jl/output", cfg;
 segment by 0–90% in 10 % increments and writes a CSV / PNG of the Gould-style
 flow vs stenosis curve.
 
+### Dynamic contrast with a clinical injection protocol
+
+`configs/coronary_hyperemic_uniphase.toml` runs the same hyperemic
+physics with the AIF now derived from a single-phase, no-chaser
+injection protocol (see the "Protocol-driven AIF" key concept). The
+`[injection_protocol]` and `[patient_physiology]` blocks are the
+user-facing knobs; everything else stays the same:
+
+```julia
+using FlowContrastSim
+cfg = load_flow_config("configs/coronary_hyperemic_uniphase.toml")
+result = run_flow_simulation("../VascularTreeSim.jl/output", cfg;
+                             output_dir="out_uniphase")
+# result.aif, result.protocol, result.physiology are also returned.
+```
+
+Three ways to set the protocol variables per run:
+
+```julia
+# 1) Edit the TOML, re-load.
+
+# 2) Pass overrides as kwargs to run_flow_simulation — kwargs win over TOML.
+run_flow_simulation("../VascularTreeSim.jl/output", cfg;
+    injection_protocol = UniphaseNoChaser(
+        weight_kg                     = 90.0,
+        contrast_concentration_mgI_ml = 320.0,
+        contrast_volume_per_kg        = 0.6,
+        injection_rate_ml_s           = 6.0),
+    patient_physiology = PatientPhysiology(
+        cardiac_output_ml_s          = 100.0,    # e.g. younger patient
+        central_transit_delay_s      = 10.0,
+        central_transit_dispersion_s = 2.5))
+
+# 3) Build a modified config once, run multiple times against it.
+cfg2 = with_protocol(cfg; protocol=UniphaseNoChaser(weight_kg=90.0))
+run_flow_simulation("../VascularTreeSim.jl/output", cfg2)
+```
+
+The same patterns work with the biphase/chaser protocols:
+
+```julia
+# Biphase fast-loading + slow-sustaining, with chaser
+run_flow_simulation("../VascularTreeSim.jl/output", cfg;
+    injection_protocol = BiphaseWithChaser(
+        weight_kg              = 80.0,
+        phase1_volume_per_kg   = 0.4,   # fast loading
+        phase1_rate_ml_s       = 6.0,
+        phase2_volume_per_kg   = 0.4,   # slow sustain
+        phase2_rate_ml_s       = 3.0,
+        chaser_volume_per_kg   = 0.5,
+        chaser_rate_ml_s       = 3.0,
+        chaser_dilution        = 0.30))  # 30:70 mix
+```
+
+### Peak-only / SVP snapshot mode
+
+For Single-Volume Perfusion (SVP) downstream — where the simulator only
+needs to feed `basis_simulator` a single iodine snapshot at the V2
+acquisition time, not the full time series — pass `peak_time_s` to
+either `simulate_contrast` or `run_flow_simulation`:
+
+```julia
+# Use AIF peak + 2 s as the V2 acquisition time (typical bolus-tracking trigger delay)
+_, aif = protocol_to_aif(cfg.injection_protocol, cfg.patient_physiology;
+                          dt=cfg.dt, t_max=cfg.t_end)
+v2_t = (argmax(aif) - 1) * cfg.dt + 2.0    # ≈ 17.8 s for default uniphase
+
+result = run_flow_simulation("../VascularTreeSim.jl/output", cfg; peak_time_s=v2_t)
+
+# result.contrast_results["LAD"].concentration is now (n_sim_segs × 1),
+# .times = [v2_t]. Memory shrinks ~N_t× compared to the full time series.
+```
+
+This avoids allocating the `(n_sim_segs × n_t)` per-tree matrix and runs
+exactly one Gaussian convolution sample per segment instead of computing
+the full `AIF ⊛ G_σ` on the time grid.
+
+### Just the AIF (no flow simulation)
+
+```julia
+times, aif = protocol_to_aif(cfg.injection_protocol, cfg.patient_physiology;
+                              dt=cfg.dt, t_max=cfg.t_end)
+# aif :: Vector{Float64}, mgI/mL, on the same time grid as the simulation
+```
+
+`examples/uniphase_protocol_aif.jl` is the end-to-end demo and writes
+`output/uniphase_aif.csv` for quick plotting. The diagnostic script
+`scripts/run_8um_uniphase.jl` is the full 8 μm phantom-grown tree run
+(loads 100 M+ segments per tree, runs hemodynamics + Taylor-Aris PDE in
+sparse mode at ≥50 μm + peak-only snapshot, writes
+`output_8um_uniphase/summary.txt`).
+
 ---
 
 ## Config TOML schema
@@ -213,8 +416,10 @@ discharge_hematocrit  = 0.45
 # physics-grounded downstream R (Pries-Secomb in-vivo for myocardium):
 capillary_bed_R_per_100g_mmHgmin_ml = 0.15   # 0.12 in coronary_hyperemic.toml
 
-# contrast bolus shape (gamma-variate) — used as the synthetic root input.
-# For real patient AIF, see ../perfusion_pipeline/scripts/step0_prepare_aif.py
+# Legacy contrast bolus shape (gamma-variate). Used only when no
+# [injection_protocol] block is present; otherwise the protocol-derived AIF
+# overrides these fields. See "Protocol-driven AIF" above. For real patient
+# AIF measurements, see ../perfusion_pipeline/scripts/step0_prepare_aif.py
 contrast_amplitude = 5.0   # mg I / mL peak
 contrast_t0   = 0.5        # s onset
 contrast_tmax = 4.0        # s peak
@@ -224,6 +429,13 @@ dt    = 0.1                # s — simulation timestep
 t_end = 20.0               # s
 max_arrival_s = 15.0       # LEGACY — accepted but ignored after the log-compress fix
 contrast_min_diameter_um = 50.0   # skip contrast on segs below this diameter
+
+# Iodine molecular diffusivity (m²/s) used in the Taylor-Aris D_eff term
+# (only consulted on the AIF / PDE path). Default is iohexol/iomeprol in
+# plasma at 37 °C. Sensitivity is logarithmic (the Taylor term and the
+# molecular term enter with opposite D_mol-dependence), so this rarely
+# needs changing.
+D_mol_m2_s = 1.5e-9
 
 # per-tree territory mass for cap_R parallel→series conversion
 [territory_masses_g]
@@ -237,13 +449,36 @@ RCA = 63.8
 LAD = 50.0
 LCX = 30.0
 RCA = 50.0
+
+# ── Optional: protocol-driven AIF (mgI/mL).
+# When present, replaces the legacy gamma-variate root input. See
+# `configs/coronary_hyperemic_uniphase.toml` for a full example.
+[injection_protocol]
+type                          = "UniphaseNoChaser"  # currently: UniphaseNoChaser
+weight_kg                     = 70.0
+contrast_concentration_mgI_ml = 370.0   # default 370 (Iomeron 370 / Omnipaque 350-equivalents)
+contrast_volume_per_kg        = 0.5     # default 0.5 mL/kg
+injection_rate_ml_s           = 5.0     # default 5 mL/s
+
+# ── Optional: patient physiology (only consulted when [injection_protocol]
+# is set). Defaults are healthy resting adult; literature ranges:
+#   cardiac_output_ml_s          50–117    (3–7 L/min)
+#   central_transit_delay_s      8–16
+#   central_transit_dispersion_s 2–5
+[patient_physiology]
+cardiac_output_ml_s          = 83.0    # = 5 L/min
+central_transit_delay_s      = 12.0
+central_transit_dispersion_s = 3.0
 ```
 
 `configs/coronary_baseline.toml` uses `cap_R = 0.15` (at-rest, Pries-Secomb)
 paired with `output_at_rest/`; `configs/coronary_hyperemic.toml` uses
 `cap_R = 0.12` (autoregulatory cap-bed relaxation) paired with `output/`
-(max-dilated). To target a brain tree, swap the masses, swap the tree dir,
-leave the physics knobs alone.
+(max-dilated). `configs/coronary_hyperemic_uniphase.toml` is the same
+hyperemic physics but uses the protocol-driven AIF with a uniphase
+injection. `configs/coronary_hyperemic_biphase_chaser.toml` shows the
+biphase + saline-chaser CTCA-style protocol. To target a brain tree,
+swap the masses, swap the tree dir, leave the physics knobs alone.
 
 ---
 
@@ -279,8 +514,23 @@ per-segment vectors:
 | `segment_volume_m3` | m³ | π r² L |
 | `transit_time_s` | s | volume / |flow| |
 
-`contrast_results[name]` is a `ContrastResult` with a sparse `(n_sim_segs ×
-n_timesteps)` concentration matrix and a `simulated_segment_ids` index.
+`contrast_results[name]` is a `ContrastResult` with the following fields
+(all sparse when `contrast_min_diameter_um > 0`):
+
+| field | dimensions | what |
+|---|---|---|
+| `times` | `n_timesteps` (or `1` in peak-only mode) | s |
+| `concentration`, `outlet_concentration` | `n_sim_segs × n_timesteps` | mgI/mL |
+| `segment_ids` | `n_sim_segs` | indices into the full tree; empty in dense mode (`row i ↔ segment i`) |
+| `arrival_s` | `n_seg` full tree | physical bolus arrival at midpoint (s); `Inf` for unreachable segments |
+| `arrival_variance_s2` | `n_seg` full tree | Taylor-Aris cumulative variance σ² (s²) at midpoint; populated on the AIF / PDE path, `Inf` on the legacy gamma path |
+
+`arrival_variance_s2` is the per-segment dispersion handle the perfusion
+pipeline can use to flag distal segments where the Gaussian convolution
+broadens the bolus by more than `~ k × dt` (i.e., where the σ-window
+covers many time samples). Useful when comparing simulated vs measured
+tissue curve widths in the downstream MBF deconvolution.
+
 The Plotly HTML viewer (`viewer_path`) animates this with a time slider +
 play/pause + per-segment hover.
 
@@ -300,6 +550,7 @@ play/pause + per-segment hover.
 | `extract_peak_iodine.jl` | run hemo + simulate_contrast for each tree, find global peak time, write per-segment peak iodine + per-segment `arrival_time.f32` (consumed by `simple_dynamic_viewer.jl` and the perfusion-pipeline voxelizer) |
 | `simple_dynamic_viewer.jl` | standalone dynamic-contrast HTML viewer at the ≥500 μm "main artery" level. Reads `arrival_time.f32` if present (physical hemo arrival); falls back to a Murray-velocity v(s) = v_root · D_s/D_root model. Does **not** use FlowContrastSim's runtime so it scales to the 357 M-segment phantom-grown trees that would OOM `build_contrast_viewer` |
 | `build_dynamic_contrast_viewer.jl` | full-runtime viewer (calls `build_contrast_viewer`); reduced budgets via `max_segments_per_branch = 800` + `time_stride = 10`. OOMs on the very largest 110 M-segment trees; use `simple_dynamic_viewer.jl` instead in that case |
+| `run_8um_uniphase.jl` | full 8 μm phantom-grown tree run (~100 M segs / tree) using `coronary_hyperemic_uniphase.toml` + Taylor-Aris PDE + peak-only V2 snapshot. Writes `output_8um_uniphase/summary.txt` with per-tree root flow, arrival times, Taylor σ statistics, and V2 peak iodine concentration. Sparse mode at 50 μm keeps memory bounded |
 
 All diagnostic scripts take the tree dir as `ARGS[1]` and never call
 `run_flow_simulation` — they're fast (~5 min) compared to the full pipeline.

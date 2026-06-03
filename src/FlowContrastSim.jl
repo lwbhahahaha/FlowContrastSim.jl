@@ -36,6 +36,7 @@ using TOML
 
 include("flow_tree.jl")
 include("protocol.jl")
+include("central_circulation.jl")
 include("flow_config.jl")
 include("hemodynamics.jl")
 include("contrast_transport.jl")
@@ -58,6 +59,22 @@ export FlowTree,
 export injection_profile,
        central_transit_kernel,
        protocol_to_aif
+
+# ── Central circulation (Bae 1998 PBPK) ──
+export Patient,
+       TriphasicProtocol,
+       CentralCirculationResult,
+       simulate_central_circulation,
+       hu_per_mgI_ml,
+       iodine_to_hu,
+       iodine_to_hu_delta,
+       bolus_trigger_time,
+       chamber_hu_at,
+       aif_from_central,
+       mass_balance,
+       total_injected_iodine_mg
+
+# ── Iodine materials + bin scheme for basis_simulator ──
 
 # ── Tree loading ──
 export load_tree,

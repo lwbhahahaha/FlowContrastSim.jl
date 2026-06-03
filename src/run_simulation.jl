@@ -24,17 +24,26 @@ function run_flow_simulation(tree_csv_dir::String, config::FlowConfig;
                              output_dir::String="output",
                              injection_protocol::Union{Nothing, AbstractInjectionProtocol, Missing}=missing,
                              patient_physiology::Union{PatientPhysiology, Missing}=missing,
-                             peak_time_s::Union{Nothing, Float64}=nothing)
+                             peak_time_s::Union{Nothing, Float64}=nothing,
+                             central_circulation::Union{Nothing, CentralCirculationResult}=nothing)
     mkpath(output_dir)
 
     # Resolve protocol / physiology: kwarg wins, then config, then default.
     eff_protocol = injection_protocol === missing ? config.injection_protocol : injection_protocol
     eff_physiology = patient_physiology === missing ? config.patient_physiology : patient_physiology
 
-    # Build AIF from protocol if one is set. AIF is shared across all
-    # three trees (they all branch off the aorta root).
+    # Build AIF. Priority:
+    #   1. `central_circulation` kwarg — use Bae C_aorta(t) directly (real physics).
+    #   2. `injection_protocol` — use protocol_to_aif gamma-kernel path.
+    #   3. Otherwise — legacy gamma-variate root input.
     aif_vec = nothing
-    if eff_protocol !== nothing
+    if central_circulation !== nothing
+        _, aif_vec = aif_from_central(central_circulation; dt=config.dt, t_max=config.t_end)
+        println("[flow] Using Bae PBPK AIF from central_circulation kwarg")
+        println("[flow]   Patient: $(central_circulation.patient.weight_kg) kg")
+        println("[flow]   Protocol: $(typeof(central_circulation.protocol).name.name)")
+        flush(stdout)
+    elseif eff_protocol !== nothing
         _, aif_vec = protocol_to_aif(eff_protocol, eff_physiology;
                                       dt=config.dt, t_max=config.t_end)
         peak_val = maximum(aif_vec)

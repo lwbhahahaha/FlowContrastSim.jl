@@ -29,10 +29,10 @@ using Printf
 using TOML
 
 # ── Inputs ───────────────────────────────────────────────────────────
-const WEIGHT_KG  = 70.0
+const WEIGHT_KG  = 100.0
 const HEIGHT_CM  = 173.0
-const PHASE1_VOL = 49.0;  const PHASE1_RATE = 5.0
-const PHASE2_VOL = 25.0   # fixed; phase2 RATE is the sweep axis
+const PHASE1_VOL = 66.0;  const PHASE1_RATE = 5.0
+const PHASE2_VOL = 33.0   # fixed; phase2 RATE is the sweep axis
 const PHASE3_VOL = 30.0;  const PHASE3_RATE = 2.5
 const CONC_MGI_ML= 370.0   # Isovue 370
 const KVP        = 120.0

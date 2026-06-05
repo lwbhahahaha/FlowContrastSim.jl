@@ -217,49 +217,54 @@ function build_scaled_params(patient::Patient; k_ps::Float64=5.0)
     return ScaledParams(V_vessel, V_cap, V_ecf, Q_organ, CO, k_ps, GFR)
 end
 
-# ── The ODE function ─────────────────────────────────────────────────
-# State: u[i] = concentration (mg I/ml) in compartment i, plus one
-# cumulative-excreted state.  All flows ml/s; time s; concentration mg/ml.
+# ── The ODE function (Bae V2 — variable-volumetric-flow extension) ───
+# V2 boosts the central path Q_central = Q_CO + Q_injection during the
+# injection window, modeling the injector-driven extra fluid through the
+# antecubital vein → SVC → RV → lung → LV → aorta. This makes chamber
+# TAC peaks earlier + higher than V1 and matches the Hubbard 2019
+# foundational "½ T_inj + transit" relation for first-pass timing.
 function bae_ode!(du, u, params, t)
-    sp, idx, inj_fn = params
+    sp, idx, inj_mass_fn, inj_volume_fn = params
 
     Cv(id)   = u[idx.vessel_idx[id]]
     Ccap(id) = u[idx.organ_cap_idx[id]]
     Cecf(id) = u[idx.organ_ecf_idx[id]]
 
-    inj_mgI_s = inj_fn(t)   # mg I/s entering antecubital vein (:v_ue_inj)
+    inj_mgI_s  = inj_mass_fn(t)     # mg I/s into v_ue_inj
+    Q_inj_ml_s = inj_volume_fn(t)   # mL/s volumetric boost (V2)
 
     # === Right heart === (RA + RV merged; all venous returns join here)
     Q_total = sp.CO
+    Q_central = Q_total + Q_inj_ml_s        # V2: boosted central flow during injection
     Q_head_v   = sp.Q_organ[:head]
     Q_ue_inj   = sp.Q_organ[:ue] * UE_SPLIT_INJ
     Q_ue_alt   = sp.Q_organ[:ue] * UE_SPLIT_ALT
     Q_bronchus = sp.Q_organ[:bronchus]
     Q_coronary = sp.Q_organ[:heart_organ]
     Q_ivc_in   = sp.Q_organ[:liver_total] + sp.Q_organ[:kidney] + sp.Q_organ[:trunk_le]
-    mass_in_rh = Q_head_v   * Cv(:v_head)     +
-                 Q_ue_inj   * Cv(:v_ue_inj)   +
-                 Q_ue_alt   * Cv(:v_ue_alt)   +
-                 Q_bronchus * Cv(:v_bronchus) +
-                 Q_coronary * Cv(:v_heart)    +
-                 Q_ivc_in   * Cv(:ivc_2)
-    mass_out_rh = Q_total * Cv(:rh)
+    mass_in_rh = Q_head_v             * Cv(:v_head)     +
+                 (Q_ue_inj + Q_inj_ml_s) * Cv(:v_ue_inj)   +    # V2 outflow boost
+                 Q_ue_alt             * Cv(:v_ue_alt)   +
+                 Q_bronchus           * Cv(:v_bronchus) +
+                 Q_coronary           * Cv(:v_heart)    +
+                 Q_ivc_in             * Cv(:ivc_2)
+    mass_out_rh = Q_central * Cv(:rh)
     du[idx.vessel_idx[:rh]] = (mass_in_rh - mass_out_rh) / sp.V_vessel[:rh]
 
     # === Pulmonary artery (RV → lung input) ===
-    du[idx.vessel_idx[:pulm_in]] = Q_total * (Cv(:rh) - Cv(:pulm_in)) / sp.V_vessel[:pulm_in]
+    du[idx.vessel_idx[:pulm_in]] = Q_central * (Cv(:rh) - Cv(:pulm_in)) / sp.V_vessel[:pulm_in]
 
     # === Lung (organ: cap + ECF with PS exchange) ===
-    Q_lung = Q_total
+    Q_lung = Q_central
     PS_lung = sp.k_ps * Q_lung
     du[idx.organ_cap_idx[:lung]] = (Q_lung * (Cv(:pulm_in) - Ccap(:lung)) -
                                      PS_lung * (Ccap(:lung) - Cecf(:lung))) / sp.V_cap[:lung]
     du[idx.organ_ecf_idx[:lung]] = PS_lung * (Ccap(:lung) - Cecf(:lung)) / sp.V_ecf[:lung]
 
     # === Pulmonary vein → Left heart → Aorta root ===
-    du[idx.vessel_idx[:pulm_out]]  = Q_total * (Ccap(:lung)  - Cv(:pulm_out)) / sp.V_vessel[:pulm_out]
-    du[idx.vessel_idx[:lh]]        = Q_total * (Cv(:pulm_out) - Cv(:lh))      / sp.V_vessel[:lh]
-    du[idx.vessel_idx[:aorta_root]]= Q_total * (Cv(:lh)       - Cv(:aorta_root)) / sp.V_vessel[:aorta_root]
+    du[idx.vessel_idx[:pulm_out]]  = Q_central * (Ccap(:lung)  - Cv(:pulm_out)) / sp.V_vessel[:pulm_out]
+    du[idx.vessel_idx[:lh]]        = Q_central * (Cv(:pulm_out) - Cv(:lh))      / sp.V_vessel[:lh]
+    du[idx.vessel_idx[:aorta_root]]= Q_central * (Cv(:lh)       - Cv(:aorta_root)) / sp.V_vessel[:aorta_root]
 
     # === Arterial feeders (each takes its organ's flow from aorta_root) ===
     for (art_id, organ_flow_id) in (
@@ -313,9 +318,14 @@ function bae_ode!(du, u, params, t)
 
     # === Venous returns into the right heart (Bae Fig. 3 parallel topology) ===
     du[idx.vessel_idx[:v_head]] = sp.Q_organ[:head] * (Ccap(:head) - Cv(:v_head)) / sp.V_vessel[:v_head]
-    # UE: injection enters here on the 162 ml/min path
+    # UE: injection enters here on the 162 ml/min path.
+    # V2 boosts the outflow rate by Q_inj_ml_s during injection (matching the
+    # rh-side flow boost), shrinking residence time 14.8 s → ~5 s for fast
+    # injections — this is the primary mechanism that makes V2's chamber peaks
+    # higher than V1's.
     du[idx.vessel_idx[:v_ue_inj]] = (Q_ue_inj * Ccap(:ue) + inj_mgI_s -
-                                      Q_ue_inj * Cv(:v_ue_inj)) / sp.V_vessel[:v_ue_inj]
+                                      (Q_ue_inj + Q_inj_ml_s) * Cv(:v_ue_inj)) /
+                                     sp.V_vessel[:v_ue_inj]
     du[idx.vessel_idx[:v_ue_alt]] = Q_ue_alt * (Ccap(:ue) - Cv(:v_ue_alt)) / sp.V_vessel[:v_ue_alt]
     du[idx.vessel_idx[:v_bronchus]] = Q_bronchus * (Ccap(:bronchus) - Cv(:v_bronchus)) / sp.V_vessel[:v_bronchus]
     du[idx.vessel_idx[:v_heart]] = sp.Q_organ[:heart_organ] * (Ccap(:heart_organ) - Cv(:v_heart)) / sp.V_vessel[:v_heart]
@@ -337,6 +347,17 @@ end
 # ─────────────────────────────────────────────────────────────────────
 # 4. Injection protocols  (extends AbstractInjectionProtocol from protocol.jl)
 # ─────────────────────────────────────────────────────────────────────
+
+"""
+    injection_volume_flow(t::Float64, p::AbstractInjectionProtocol) -> Float64
+
+Volumetric flow rate (mL/s) of injected fluid (contrast or saline) at time t,
+entering the antecubital vein. Required by the Bae V2 ODE function: during
+injection, the central path Q_central = Q_CO + Q_injection (boosted volumetric
+flow), which reduces residence time in v_ue_inj from ~14.8 s to ~5 s for
+fast injections and shifts chamber TAC peak earlier + higher than V1.
+"""
+function injection_volume_flow end
 
 """
     TriphasicProtocol(; phase1_volume_ml, phase1_rate_ml_s, phase2_volume_ml,
@@ -378,6 +399,19 @@ function injection_mass_flow(t::Float64, p::TriphasicProtocol)
     if t < t3;   return p.phase3_rate_ml_s * c0 * p.phase3_dilution; end
     return 0.0
 end
+
+function injection_volume_flow(t::Float64, p::TriphasicProtocol)
+    t1 = p.phase1_volume_ml / p.phase1_rate_ml_s
+    t2 = t1 + p.phase2_volume_ml / p.phase2_rate_ml_s
+    t3 = t2 + p.phase3_volume_ml / p.phase3_rate_ml_s
+    if t < 0.0;  return 0.0; end
+    if t < t1;   return p.phase1_rate_ml_s; end
+    if t < t2;   return p.phase2_rate_ml_s; end
+    if t < t3;   return p.phase3_rate_ml_s; end
+    return 0.0
+end
+# Default fallback for other protocol subtypes — assume no boost (V1 behavior).
+injection_volume_flow(t::Float64, p::AbstractInjectionProtocol) = 0.0
 
 function phase_boundary_times(p::TriphasicProtocol)
     ts = Float64[0.0]
@@ -495,10 +529,11 @@ function simulate_central_circulation(patient::Patient,
                                       dt_save::Float64=0.1)
     idx = build_index(REFERENCE_COMPARTMENTS)
     sp  = build_scaled_params(patient; k_ps=k_ps)
-    inj_fn(t) = injection_mass_flow(t, protocol)
+    inj_mass_fn(t) = injection_mass_flow(t, protocol)
+    inj_vol_fn(t)  = injection_volume_flow(t, protocol)
     tstops = _protocol_tstops(protocol)
     u0 = zeros(idx.n_states)
-    params = (sp, idx, inj_fn)
+    params = (sp, idx, inj_mass_fn, inj_vol_fn)
     prob = ODEProblem(bae_ode!, u0, tspan, params)
     sol = solve(prob, Tsit5(); reltol=1e-8, abstol=1e-11,
                 saveat=dt_save, tstops=tstops)

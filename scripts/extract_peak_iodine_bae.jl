@@ -29,11 +29,11 @@ using Printf
 using TOML
 
 # ── Inputs ───────────────────────────────────────────────────────────
-const WEIGHT_KG  = 100.0
+const WEIGHT_KG  = 90.0
 const HEIGHT_CM  = 173.0
-const PHASE1_VOL = 66.0;  const PHASE1_RATE = 5.0
-const PHASE2_VOL = 33.0   # fixed; phase2 RATE is the sweep axis
-const PHASE3_VOL = 30.0;  const PHASE3_RATE = 2.5
+const PHASE1_VOL = 72.0;  const PHASE1_RATE = 5.0
+const PHASE2_VOL = 30.0   # saline chaser (dilution 0 below); phase2 RATE = CLI arg
+const PHASE3_VOL = 0.0;   const PHASE3_RATE = 5.0
 const CONC_MGI_ML= 370.0   # Isovue 370
 const KVP        = 120.0
 const TRIGGER_HU = 150.0
@@ -126,7 +126,7 @@ function main()
         phase1_volume_ml=PHASE1_VOL, phase1_rate_ml_s=PHASE1_RATE,
         phase2_volume_ml=PHASE2_VOL, phase2_rate_ml_s=phase2_rate,
         phase3_volume_ml=PHASE3_VOL, phase3_rate_ml_s=PHASE3_RATE,
-        phase2_dilution=1.0, phase3_dilution=0.0,
+        phase2_dilution=0.0, phase3_dilution=0.0,   # phase2 = saline chaser
     )
     bae = simulate_central_circulation(patient, protocol; tspan=(0.0, T_END), dt_save=0.05)
     t_trigger = bolus_trigger_time(bae; threshold_delta_HU=TRIGGER_HU, kvp=KVP)
@@ -210,10 +210,10 @@ function main()
     peak_time = times[peak_ti]
     @info "global peak @ t=$(round(peak_time,digits=2))s (timestep $(peak_ti)/$(nt))"
 
-    # Note: scan-time chamber values come from Bae directly, not from peak_time
-    # of the tree contrast (those may differ — the tree's contrast wave peak is
-    # downstream of the aorta peak by the tree's transit time, but the chambers
-    # see the BAE-time peak shape directly).
+    # Scan AT the vessel-tree concentration peak: sample chambers at peak_time too
+    # so the entire virtual scan is one self-consistent timepoint (= the tree peak).
+    t_scan = peak_time
+    @info "  overriding scan time → tree concentration peak @ $(round(t_scan,digits=2))s"
     C_aorta_scan = _interp_grid(bae.times, bae.C_aorta, t_scan)
     C_RV_scan    = _interp_grid(bae.times, bae.C_RV,    t_scan)
     C_LV_scan    = _interp_grid(bae.times, bae.C_LV,    t_scan)

@@ -20,6 +20,7 @@ if [[ $# -lt 1 ]]; then
 fi
 RATE="$1"
 SCAN_DELAY="${2:-6.1}"
+WORK_OVERRIDE="${3:-}"   # optional: full path to working dir (else defaults under phantom_ct_input/)
 
 # Top-level paths (absolute)
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.."  && pwd)"
@@ -27,7 +28,7 @@ TREE_DIR="${ROOT}/VascularTreeSim.jl/output"
 PHANTOM_SRC="/home/molloi-lab/smb_mount/shared_drive/Shu Nie/PVAT_Analysis/digital phantoms/vmale50_1600x1400x500_8bit_little_endian_act_1.raw"
 
 # Per-rate working dirs
-WORK="${ROOT}/phantom_ct_input/bae_uci_r${RATE}"
+WORK="${WORK_OVERRIDE:-${ROOT}/phantom_ct_input/bae_uci_r${RATE}}"
 PEAK_DIR="${WORK}/peak_iodine"
 PHANTOM_PEAK_DIR="${WORK}/peak_phantom"
 CHAMBER_DIR="${WORK}/chamber_patched"

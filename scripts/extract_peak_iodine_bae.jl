@@ -114,8 +114,13 @@ function main()
     out_dir   = ARGS[2]
     phase2_rate = parse(Float64, ARGS[3])
     scan_delay  = length(ARGS) >= 4 ? parse(Float64, ARGS[4]) : 6.1
+    # Dynamic time-series: FRAMES="t1,t2,..." dumps per-segment PDE contrast at
+    # each timepoint (real simulated capillary contrast, for the honest dynamic
+    # perfusion) in addition to the peak snapshot.
+    frame_times = haskey(ENV, "FRAMES") ? Float64[parse(Float64, strip(s)) for s in split(ENV["FRAMES"], ",")] : Float64[]
     isdir(tree_dir) || error("tree_dir not found: $tree_dir")
     mkpath(out_dir)
+    isempty(frame_times) || @info "dynamic frames: $(frame_times) s"
 
     @info "Bae UCI triphasic — phase2 rate $(phase2_rate) mL/s, scan_delay $(scan_delay) s after trigger"
 
@@ -314,6 +319,39 @@ function main()
         end
     end
     @info "wrote $(meta_path)"
+
+    # ── Dynamic time-series frames: the REAL simulated per-segment contrast at
+    #    each requested timepoint (voxelized downstream by apply_contrast_at_peak).
+    if !isempty(frame_times)
+        for tf in frame_times
+            ti_f = argmin(abs.(times .- tf))
+            fdir = joinpath(out_dir, @sprintf("frame_%02ds", round(Int, tf)))
+            mkpath(fdir)
+            for (name, tree) in trees
+                iod = build_peak_iodine_vector(tree, crs[name], ti_f)
+                open(joinpath(fdir, "$(lowercase(name))_peak_iodine.f32"), "w") do io; write(io, iod); end
+            end
+            C_ao = _interp_grid(bae.times, bae.C_aorta, tf)
+            C_rv = _interp_grid(bae.times, bae.C_RV, tf)
+            C_lv = _interp_grid(bae.times, bae.C_LV, tf)
+            C_pa = _interp_grid(bae.times, bae.C_pulm_artery, tf)
+            C_pv = _interp_grid(bae.times, bae.C_pulm_vein, tf)
+            open(joinpath(fdir, "peak_metadata.toml"), "w") do io
+                println(io, "[peak]")
+                @printf(io, "time_s = %.4f\n", times[ti_f])
+                @printf(io, "total_iodine_mass_mg = %.6f\n", total_mass_mg[ti_f])
+                @printf(io, "max_iodine_concentration_mg_per_mL = %.6f\n", iodine_max)
+                println(io)
+                println(io, "[chamber_concentrations]")
+                @printf(io, "aorta_root_mgI_ml = %.6f\n", C_ao)
+                @printf(io, "right_heart_mgI_ml = %.6f\n", C_rv)
+                @printf(io, "left_heart_mgI_ml = %.6f\n", C_lv)
+                @printf(io, "pulm_artery_mgI_ml = %.6f\n", C_pa)
+                @printf(io, "pulm_vein_mgI_ml = %.6f\n", C_pv)
+            end
+            @info "frame t=$(round(times[ti_f],digits=1))s (ti=$ti_f): iodine + chambers (LV C=$(round(C_lv,digits=2)) mgI/mL)"
+        end
+    end
 end
 
 main()
